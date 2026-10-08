@@ -1,6 +1,7 @@
 import os
 import queue
-import re
+import shutil
+import subprocess
 import sys
 import locale
 import threading
@@ -15,7 +16,6 @@ from tools.model_registry import discover_models
 from app.version import APP_TITLE, BUILD_LABEL
 
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
-os.environ.setdefault("SD_ENABLE_ASIO", "1")
 
 os.environ["OMP_NUM_THREADS"] = "4"
 
@@ -102,16 +102,10 @@ UI_TEXT = {
     "model": ("モデル", "Model"),
     "reload": ("再読み込み", "Reload"),
     "device_type": ("デバイス種別", "Audio system"),
-    "wasapi_exclusive": ("WASAPI排他", "WASAPI exclusive"),
-    "show_legacy_devices": ("互換デバイスを表示", "Show compatibility devices"),
     "reload_devices": ("デバイスリストのリロード", "Reload device list"),
     "input_device": ("入力デバイス", "Input device"),
     "output_device": ("出力デバイス", "Output device"),
     "monitor_device": ("モニターデバイス", "Monitor device"),
-    "asio_driver": ("ASIOドライバー", "ASIO driver"),
-    "asio_input_channels": ("ASIO入力", "ASIO input"),
-    "asio_output_channels": ("ASIO出力", "ASIO output"),
-    "asio_monitor_channels": ("ASIOモニター", "ASIO monitor"),
     "active_rate": ("動作サンプルレート：", "Sample rate:"),
     "input_gain": ("入力ゲイン (dB)", "Input gain (dB)"),
     "output_gain": ("出力ゲイン (dB)", "Output gain (dB)"),
@@ -295,6 +289,15 @@ if __name__ == "__main__":
     from configs.config import Config, get_device_dtype_sm
     from infer import rtrvc as rvc_for_realtime
     from tools.audio_fifo import AudioFrameFifo
+    from tools.audio_routing import (
+        ALSA_API,
+        ALSA_SHARED_PCMS,
+        HOSTAPI_LABELS,
+        JACK_API,
+        is_native_api,
+        scatter_mono,
+        select_channels,
+    )
     from tools.cuda_graph import cuda_graph_enabled, run_cuda_graph
     from tools.file_audio_source import FileAudioSource
     from tools.wav_recorder import WavRecorder
@@ -326,8 +329,6 @@ if __name__ == "__main__":
             self.sg_input_hostapi = ""
             self.sg_output_hostapi = ""
             self.sg_monitor_hostapi = ""
-            self.wasapi_exclusive = False
-            self.sg_wasapi_exclusive = False
             self.show_legacy_devices = False
             self.sg_input_device = ""
             self.sg_output_device = ""
@@ -358,15 +359,13 @@ if __name__ == "__main__":
             self.input_stream = None
             self.output_stream = None
             self.output_queue = None
-            self.asio_input_fifo = None
-            self.asio_worker_stop = None
-            self.asio_worker_wakeup = None
-            self.asio_worker = None
-            self.asio_duplex_main_channels = 0
-            self.asio_duplex_monitor_channels = 0
-            self.input_wasapi_settings = None
-            self.output_wasapi_settings = None
-            self.monitor_wasapi_settings = None
+            self.native_input_fifo = None
+            self.native_worker_stop = None
+            self.native_worker_wakeup = None
+            self.native_worker = None
+            self.input_selectors = []
+            self.output_selectors = []
+            self.monitor_selectors = []
             self.last_input_meter_update = 0.0
             self.last_output_meter_update = 0.0
             self.latest_input_meter = 0.0
@@ -384,7 +383,10 @@ if __name__ == "__main__":
             self.file_source_active = False
             self.pending_model_settings_name = None
             self.model_settings_save_due = 0.0
-            self.ffmpeg_path = os.path.join(now_dir, "tools", "ffmpeg", "ffmpeg.exe")
+            self.ffmpeg_path = (
+                shutil.which("ffmpeg")
+                or os.path.join(now_dir, "tools", "ffmpeg", "ffmpeg")
+            )
             self.models_root = os.path.join(now_dir, "models")
             os.makedirs(self.models_root, exist_ok=True)
             self.startup_screen.set_text(
@@ -639,9 +641,9 @@ if __name__ == "__main__":
                 return
             if not os.path.isfile(self.ffmpeg_path):
                 sg.popup_error(
-                    "同梱FFmpegが見つかりません。tools\\ffmpeg\\ffmpeg.exe を確認してください。"
+                    "FFmpegが見つかりません。ffmpeg をインストールしてください。"
                     if IS_JAPANESE_UI
-                    else "Bundled FFmpeg was not found at tools\\ffmpeg\\ffmpeg.exe."
+                    else "FFmpeg was not found. Install ffmpeg and make sure it is on PATH."
                 )
                 return
             self.stop_file_playback()
@@ -791,44 +793,10 @@ if __name__ == "__main__":
                 data["sg_output_device"] = self.normalize_device_choice(
                     data.get("sg_output_device", ""), "output", old_api
                 )
-                for device_key, channel_key, mapping, selector_mapping in (
-                    (
-                        "sg_input_device",
-                        "sg_asio_input_channels",
-                        self.input_device_map,
-                        self.input_asio_selectors,
-                    ),
-                    (
-                        "sg_output_device",
-                        "sg_asio_output_channels",
-                        self.output_device_map,
-                        self.output_asio_selectors,
-                    ),
-                ):
-                    saved_channels = data.get(channel_key)
-                    selected_label = data.get(device_key, "")
-                    selected_index = mapping.get(selected_label)
-                    if saved_channels and selected_index is not None:
-                        try:
-                            target_selectors = self.parse_channel_pair(saved_channels)
-                        except (TypeError, ValueError):
-                            target_selectors = []
-                        migrated_label = next(
-                            (
-                                label
-                                for label, index in mapping.items()
-                                if index == selected_index
-                                and selector_mapping.get(label) == target_selectors
-                            ),
-                            "",
-                        )
-                        if migrated_label:
-                            data[device_key] = migrated_label
             except:
                 with open(realtime_config_path, "w", encoding="utf8") as j:
                     data = {
                         "model_name": "",
-                        "sg_wasapi_exclusive": False,
                         "sg_show_legacy_devices": False,
                         "sg_input_device": self.normalize_device_choice(
                             "", "input"
@@ -1112,33 +1080,15 @@ if __name__ == "__main__":
                             [
                                 sg.Text(ui_text("active_rate")),
                                 sg.Text("-- Hz", key="sr_stream"),
-                                sg.Text("", size=(2, 1)),
-                                sg.Checkbox(
-                                    (
-                                        "WASAPI排他モード（対応デバイスのみ）"
-                                        if IS_JAPANESE_UI
-                                        else "WASAPI exclusive mode (supported devices only)"
-                                    ),
-                                    key="sg_wasapi_exclusive",
-                                    default=data.get(
-                                        "sg_wasapi_exclusive", False
-                                    ),
-                                    enable_events=True,
-                                    tooltip=(
-                                        "対応しているWASAPI端点を排他モードで開きます"
-                                        if IS_JAPANESE_UI
-                                        else "Open supported WASAPI endpoints in exclusive mode"
-                                    ),
-                                ),
                             ],
                             [
                                 sg.Column(
                                     key="file_input_container",
                                     layout=[
                                         [
-                                            sg.Button(FILE_UI_TEXT["play"], key="play_audio_file", width=FILE_MEDIA_BUTTON_WIDTH, font_family="Segoe UI Symbol", button_style="small"),
-                                            sg.Button(FILE_UI_TEXT["pause"], key="pause_audio_file", width=FILE_MEDIA_BUTTON_WIDTH, font_family="Segoe UI Symbol", button_style="small"),
-                                            sg.Button(FILE_UI_TEXT["stop"], key="stop_audio_file", width=FILE_MEDIA_BUTTON_WIDTH, font_family="Segoe UI Symbol", button_style="small"),
+                                            sg.Button(FILE_UI_TEXT["play"], key="play_audio_file", width=FILE_MEDIA_BUTTON_WIDTH, font_family=sg.SYMBOL_FONT_FAMILY, button_style="small"),
+                                            sg.Button(FILE_UI_TEXT["pause"], key="pause_audio_file", width=FILE_MEDIA_BUTTON_WIDTH, font_family=sg.SYMBOL_FONT_FAMILY, button_style="small"),
+                                            sg.Button(FILE_UI_TEXT["stop"], key="stop_audio_file", width=FILE_MEDIA_BUTTON_WIDTH, font_family=sg.SYMBOL_FONT_FAMILY, button_style="small"),
                                             sg.Slider(
                                                 range=(0, 1),
                                                 default_value=0,
@@ -1605,7 +1555,7 @@ if __name__ == "__main__":
         def log_startup_diagnostics(self, data):
             """Log release-relevant checks without opening any audio stream."""
             printt("=== Startup diagnostics ===")
-            printt("FFmpeg bundled: %s", os.path.isfile(self.ffmpeg_path))
+            printt("FFmpeg: %s (found=%s)", self.ffmpeg_path, os.path.isfile(self.ffmpeg_path))
             printt("Models discovered: %s", len(self.model_names))
             printt("CUDA available: %s", torch.cuda.is_available())
             if torch.cuda.is_available():
@@ -1626,7 +1576,6 @@ if __name__ == "__main__":
             printt("=== Startup diagnostics complete ===")
 
         def log_active_audio_route(self):
-            requested_exclusive = bool(self.gui_config.sg_wasapi_exclusive)
             printt("=== Active audio route ===")
             printt(
                 "Input=%s / Output=%s / Monitor=%s",
@@ -1635,24 +1584,17 @@ if __name__ == "__main__":
                 self.gui_config.sg_monitor_hostapi or "Disabled",
             )
             printt(
-                "Rate=%s Hz / Chunk=%.3f sec / WASAPI exclusive requested=%s",
+                "Rate=%s Hz / Chunk=%.3f sec / PIPEWIRE_QUANTUM=%s",
                 self.gui_config.samplerate,
                 self.gui_config.block_time,
-                requested_exclusive,
+                os.environ.get("PIPEWIRE_QUANTUM", "(server default)"),
             )
             printt(
-                "WASAPI exclusive active: input=%s output=%s monitor=%s",
-                self.input_wasapi_settings is not None,
-                self.output_wasapi_settings is not None,
-                self.monitor_wasapi_settings is not None,
+                "Channel selectors: input=%s output=%s monitor=%s",
+                self.input_selectors,
+                self.output_selectors,
+                self.monitor_selectors,
             )
-            if self.gui_config.sg_input_hostapi == "ASIO" or self.gui_config.sg_output_hostapi == "ASIO":
-                printt(
-                    "ASIO selectors: input=%s output=%s monitor=%s",
-                    self.asio_input_selectors,
-                    self.asio_output_selectors,
-                    self.asio_monitor_selectors,
-                )
             printt("=== Active audio route complete ===")
 
         def restore_console_streams(self):
@@ -1862,7 +1804,11 @@ if __name__ == "__main__":
                     continue
                 if event == "open_recording_folder":
                     os.makedirs(self.recording_folder, exist_ok=True)
-                    os.startfile(self.recording_folder)
+                    subprocess.Popen(
+                        ["xdg-open", self.recording_folder],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
                     continue
                 if event == "toggle_recording":
                     self.set_recording(not self.recorder.active, values)
@@ -2000,7 +1946,6 @@ if __name__ == "__main__":
                             "model_selector_mode": "list" if self.model_gallery_visible else "combo",
                             "theme_mode": self.theme_mode,
                             "gpu_device": values["gpu_device"],
-                            "sg_wasapi_exclusive": values["sg_wasapi_exclusive"],
                             "sg_show_legacy_devices": False,
                             "sg_input_device": values["sg_input_device"],
                             "sg_output_device": values["sg_output_device"],
@@ -2144,9 +2089,9 @@ if __name__ == "__main__":
                     return False
                 if not os.path.isfile(self.ffmpeg_path):
                     sg.popup_error(
-                        "同梱FFmpegが見つかりません。"
+                        "FFmpegが見つかりません。"
                         if IS_JAPANESE_UI
-                        else "Bundled FFmpeg was not found."
+                        else "FFmpeg was not found."
                     )
                     return False
             try:
@@ -2159,9 +2104,6 @@ if __name__ == "__main__":
                 sg.popup_error(str(error))
                 return False
             # self.device_latency = values["device_latency"]
-            self.gui_config.sg_wasapi_exclusive = bool(
-                values["sg_wasapi_exclusive"]
-            )
             self.gui_config.show_legacy_devices = False
             self.gui_config.sg_input_device = values["sg_input_device"]
             self.gui_config.sg_output_device = values["sg_output_device"]
@@ -2212,7 +2154,7 @@ if __name__ == "__main__":
                 self.rvc if hasattr(self, "rvc") else None,
             )
             # Decoded files are always supplied as mono float32 blocks.
-            # Do not inherit a disabled or ASIO input endpoint's channel
+            # Do not inherit a disabled or JACK input endpoint's channel
             # layout when the input source is a file.
             self.gui_config.channels = (
                 1 if self.file_source_active else self.get_device_channels()
@@ -2394,217 +2336,89 @@ if __name__ == "__main__":
                 if self.file_source_active:
                     self.start_file_stream()
                     return
-                if self.gui_config.sg_input_hostapi == "ASIO":
-                    self.start_asio_input_route()
+                if is_native_api(self.gui_config.sg_input_hostapi):
+                    self.start_native_input_route()
                     return
 
-                input_extra = None
-                output_extra = None
-                input_channels = self.gui_config.channels
-                output_channels = self.gui_config.output_channels
-                if (
-                    "WASAPI" in self.gui_config.sg_input_hostapi
-                    and self.gui_config.sg_wasapi_exclusive
-                ):
-                    input_extra = self.input_wasapi_settings
-                if self.gui_config.sg_output_hostapi == "ASIO":
-                    output_selectors = (
-                        self.asio_output_selectors + self.asio_monitor_selectors
-                    )
-                    output_extra = sd.AsioSettings(
-                        channel_selectors=output_selectors
-                    )
-                    output_channels = len(output_selectors)
-                elif (
-                    "WASAPI" in self.gui_config.sg_output_hostapi
-                    and self.gui_config.sg_wasapi_exclusive
-                ):
-                    output_extra = self.output_wasapi_settings
-                self.output_queue = (
-                    AudioFrameFifo(1, max_frames=self.block_frame * 4)
-                    if self.gui_config.sg_output_hostapi == "ASIO"
-                    else queue.Queue(maxsize=3)
-                )
-                self.output_stream = sd.OutputStream(
-                    callback=self.output_audio_callback,
-                    blocksize=(
-                        0
-                        if self.gui_config.sg_output_hostapi == "ASIO"
-                        else self.block_frame
-                    ),
-                    samplerate=self.gui_config.samplerate,
-                    channels=output_channels,
-                    device=sd.default.device[1],
-                    dtype="float32",
-                    extra_settings=output_extra,
-                )
+                self.start_output_stream()
                 self.input_stream = sd.InputStream(
                     callback=self.audio_callback,
                     blocksize=self.block_frame,
                     samplerate=self.gui_config.samplerate,
-                    channels=input_channels,
+                    channels=self.gui_config.channels,
                     device=sd.default.device[0],
                     dtype="float32",
-                    extra_settings=input_extra,
                 )
-                self.output_stream.start()
                 self.input_stream.start()
                 self.stream = self.output_stream
-                if self.gui_config.sg_monitor_hostapi != "ASIO":
-                    self.start_monitor_stream()
+                self.start_monitor_stream()
 
         def start_file_stream(self):
             """Start only the output side; file decoding feeds audio_callback."""
-            output_extra = None
-            output_channels = self.gui_config.output_channels
-            if self.gui_config.sg_output_hostapi == "ASIO":
-                selectors = self.asio_output_selectors + self.asio_monitor_selectors
-                output_extra = sd.AsioSettings(channel_selectors=selectors)
-                output_channels = len(selectors)
-            elif (
-                "WASAPI" in self.gui_config.sg_output_hostapi
-                and self.gui_config.sg_wasapi_exclusive
-            ):
-                output_extra = self.output_wasapi_settings
-            # Match the ordinary microphone/WASAPI path.  ASIO still needs a
-            # frame FIFO because its callback size is driver-owned; all other
-            # output paths use the same bounded block queue as microphone
-            # conversion.
+            self.start_output_stream()
+            self.stream = self.output_stream
+            self.start_monitor_stream()
+
+        def start_output_stream(self, native=None):
+            """Open the main output.
+
+            JACK owns its period size, so a JACK output (or any output fed by
+            the native input worker) reads from a frame FIFO with blocksize=0.
+            ALSA outputs keep the fixed RVC block queue.
+            """
+            if native is None:
+                native = is_native_api(self.gui_config.sg_output_hostapi)
             self.output_queue = (
                 AudioFrameFifo(1, max_frames=self.block_frame * 4)
-                if self.gui_config.sg_output_hostapi == "ASIO"
+                if native
                 else queue.Queue(maxsize=3)
             )
             self.output_stream = sd.OutputStream(
                 callback=self.output_audio_callback,
-                blocksize=0 if self.gui_config.sg_output_hostapi == "ASIO" else self.block_frame,
+                blocksize=0 if native else self.block_frame,
                 samplerate=self.gui_config.samplerate,
-                channels=output_channels,
+                channels=self.gui_config.output_channels,
                 device=sd.default.device[1],
                 dtype="float32",
-                extra_settings=output_extra,
             )
             self.output_stream.start()
-            self.stream = self.output_stream
-            if self.gui_config.sg_monitor_hostapi != "ASIO":
-                self.start_monitor_stream()
 
-        def start_asio_input_route(self):
-            """Keep ASIO's native callback size separate from the RVC chunk."""
-            input_device = sd.default.device[0]
-            output_on_asio = self.gui_config.sg_output_hostapi == "ASIO"
-            monitor_uses_asio_driver = (
-                self.gui_config.sg_monitor_hostapi == "ASIO"
-            )
-            monitor_on_asio = (
-                monitor_uses_asio_driver and bool(self.asio_monitor_selectors)
-            )
-            if output_on_asio and sd.default.device[1] != input_device:
-                raise ValueError(
-                    "Native ASIO input and output must use the same ASIO driver. "
-                    "Use a Windows/WASAPI endpoint for mixed-driver output."
-                )
-            if (
-                monitor_uses_asio_driver
-                and self.monitor_device_index != input_device
-            ):
-                raise ValueError(
-                    "Native ASIO input and monitor must use the same ASIO driver."
-                )
-
-            self.asio_duplex_main_channels = (
-                len(self.asio_output_selectors) if output_on_asio else 0
-            )
-            self.asio_duplex_monitor_channels = (
-                len(self.asio_monitor_selectors) if monitor_on_asio else 0
-            )
-            output_selectors = []
-            if output_on_asio:
-                output_selectors.extend(self.asio_output_selectors)
-            if monitor_on_asio:
-                output_selectors.extend(self.asio_monitor_selectors)
-
-            # These are capacity limits, not an added latency preset.  ASIO
-            # callbacks feed their native 64/128/256-frame blocks into the
+        def start_native_input_route(self):
+            """Keep JACK's native period size separate from the RVC chunk."""
+            # These are capacity limits, not an added latency preset.  JACK
+            # callbacks feed their native 64/128/256-frame periods into the
             # input FIFO; the worker consumes exact RVC chunks.
             fifo_capacity = self.block_frame * 4
-            self.asio_input_fifo = AudioFrameFifo(
-                len(self.asio_input_selectors), max_frames=fifo_capacity
+            self.native_input_fifo = AudioFrameFifo(
+                len(self.input_selectors), max_frames=fifo_capacity
             )
-            self.output_queue = AudioFrameFifo(1, max_frames=fifo_capacity)
-            self.monitor_queue = (
-                AudioFrameFifo(1, max_frames=fifo_capacity)
-                if self.monitor_device_index is not None
-                else None
-            )
-            self.asio_worker_stop = threading.Event()
-            self.asio_worker_wakeup = threading.Event()
-            self.asio_worker = threading.Thread(
-                target=self.asio_inference_worker,
-                name="rvc-asio-inference",
+            self.native_worker_stop = threading.Event()
+            self.native_worker_wakeup = threading.Event()
+            self.native_worker = threading.Thread(
+                target=self.native_inference_worker,
+                name="rvc-native-inference",
                 daemon=True,
             )
-
-            if not output_on_asio:
-                output_extra = (
-                    self.output_wasapi_settings
-                    if (
-                        "WASAPI" in self.gui_config.sg_output_hostapi
-                        and self.gui_config.sg_wasapi_exclusive
-                    )
-                    else None
-                )
-                self.output_stream = sd.OutputStream(
-                    callback=self.output_audio_callback,
-                    blocksize=0,
-                    samplerate=self.gui_config.samplerate,
-                    channels=self.gui_config.output_channels,
-                    device=sd.default.device[1],
-                    dtype="float32",
-                    extra_settings=output_extra,
-                )
-                self.output_stream.start()
-
-            if not monitor_uses_asio_driver:
-                self.start_monitor_stream()
-
-            if output_selectors:
-                self.input_stream = sd.Stream(
-                    callback=self.asio_fifo_duplex_callback,
-                    blocksize=0,
-                    samplerate=self.gui_config.samplerate,
-                    channels=(len(self.asio_input_selectors), len(output_selectors)),
-                    device=(input_device, input_device),
-                    dtype="float32",
-                    extra_settings=(
-                        sd.AsioSettings(
-                            channel_selectors=self.asio_input_selectors
-                        ),
-                        sd.AsioSettings(channel_selectors=output_selectors),
-                    ),
-                )
-            else:
-                self.input_stream = sd.InputStream(
-                    callback=self.asio_fifo_input_callback,
-                    blocksize=0,
-                    samplerate=self.gui_config.samplerate,
-                    channels=len(self.asio_input_selectors),
-                    device=input_device,
-                    dtype="float32",
-                    extra_settings=sd.AsioSettings(
-                        channel_selectors=self.asio_input_selectors
-                    ),
-                )
-            self.asio_worker.start()
+            self.start_output_stream(native=True)
+            self.start_monitor_stream()
+            self.input_stream = sd.InputStream(
+                callback=self.native_fifo_input_callback,
+                blocksize=0,
+                samplerate=self.gui_config.samplerate,
+                channels=self.gui_config.channels,
+                device=sd.default.device[0],
+                dtype="float32",
+            )
+            self.native_worker.start()
             self.input_stream.start()
             self.stream = self.input_stream
 
-        def asio_inference_worker(self):
-            while not self.asio_worker_stop.is_set():
-                self.asio_worker_wakeup.wait(0.05)
-                self.asio_worker_wakeup.clear()
-                while not self.asio_worker_stop.is_set():
-                    input_block = self.asio_input_fifo.read(
+        def native_inference_worker(self):
+            while not self.native_worker_stop.is_set():
+                self.native_worker_wakeup.wait(0.05)
+                self.native_worker_wakeup.clear()
+                while not self.native_worker_stop.is_set():
+                    input_block = self.native_input_fifo.read(
                         self.block_frame, exact=True
                     )
                     if input_block is None:
@@ -2615,35 +2429,14 @@ if __name__ == "__main__":
                         )
                     except Exception:
                         printt(traceback.format_exc())
-                        self.asio_worker_stop.set()
+                        self.native_worker_stop.set()
                         return
 
-        def asio_fifo_input_callback(self, indata, frames, times, status):
-            self.asio_input_fifo.write(indata)
-            self.asio_worker_wakeup.set()
-
-        def asio_fifo_duplex_callback(self, indata, outdata, frames, times, status):
-            outdata.fill(0)
-            main = self.read_audio_target(self.output_queue, frames)
-            monitor = self.read_audio_target(self.monitor_queue, frames)
-            main_channels = self.asio_duplex_main_channels
-            monitor_channels = self.asio_duplex_monitor_channels
-            if main is not None and main_channels:
-                outdata[: main.shape[0], :main_channels] = main[:, :1]
-            if monitor is not None and monitor_channels:
-                start = main_channels
-                outdata[: monitor.shape[0], start : start + monitor_channels] = (
-                    monitor[:, :1]
-                )
-            # Record the block that is actually delivered to the output driver,
-            # not the earlier inference result.  That keeps its real buffering
-            # delay relative to the input timeline.
-            if main is None:
-                self.recorder.enqueue("output", np.zeros(frames, dtype=np.float32))
-            else:
-                self.recorder.enqueue("output", main[:, 0])
-            self.asio_input_fifo.write(indata)
-            self.asio_worker_wakeup.set()
+        def native_fifo_input_callback(self, indata, frames, times, status):
+            self.native_input_fifo.write(
+                select_channels(indata, self.input_selectors)
+            )
+            self.native_worker_wakeup.set()
 
         def output_audio_callback(self, outdata, frames, times, status):
             block = self.read_audio_target(self.output_queue, frames)
@@ -2674,17 +2467,8 @@ if __name__ == "__main__":
             if block is None:
                 return
             sample_count = min(outdata.shape[0], block.shape[0])
-            main_channels = (
-                len(self.asio_output_selectors)
-                if self.gui_config.sg_output_hostapi == "ASIO"
-                else outdata.shape[1]
-            )
             mono = block[:sample_count, 0] if block.ndim == 2 else block[:sample_count]
-            outdata[:sample_count, :main_channels] = mono[:, None]
-            if outdata.shape[1] > main_channels:
-                outdata[:sample_count, main_channels:] = (
-                    mono[:, None] * self.gui_config.monitor_gain
-                )
+            scatter_mono(outdata, mono, self.output_selectors)
 
         def write_monitor_block(self, outdata, block):
             outdata.fill(0)
@@ -2701,25 +2485,14 @@ if __name__ == "__main__":
                 return
 
             try:
-                monitor_extra = (
-                    self.monitor_wasapi_settings
-                    if (
-                        "WASAPI" in self.gui_config.sg_monitor_hostapi
-                        and self.gui_config.sg_wasapi_exclusive
-                    )
-                    else None
-                )
-                device_info = sd.query_devices(self.monitor_device_index)
-                self.monitor_channels = min(
-                    int(device_info["max_output_channels"]),
-                    2,
+                self.monitor_channels = self.stream_channels(
+                    self.monitor_device_index, "output", self.monitor_selectors
                 )
                 sd.check_output_settings(
                     device=self.monitor_device_index,
                     channels=self.monitor_channels,
                     dtype="float32",
                     samplerate=self.gui_config.samplerate,
-                    extra_settings=monitor_extra,
                 )
                 self.monitor_queue = AudioFrameFifo(
                     1, max_frames=self.block_frame * 4
@@ -2731,7 +2504,6 @@ if __name__ == "__main__":
                     samplerate=self.gui_config.samplerate,
                     channels=self.monitor_channels,
                     dtype="float32",
-                    extra_settings=monitor_extra,
                 )
                 self.monitor_stream.start()
             except Exception as error:
@@ -2752,7 +2524,7 @@ if __name__ == "__main__":
                 return
             sample_count = min(frames, block.shape[0])
             mono = block[:sample_count, 0] if block.ndim == 2 else block[:sample_count]
-            outdata[:sample_count, :] = mono[:, None]
+            scatter_mono(outdata, mono, self.monitor_selectors)
 
         def stop_stream(self):
             global flag_vc
@@ -2760,36 +2532,24 @@ if __name__ == "__main__":
             self.stop_file_playback()
             if self.recorder.active:
                 self.set_recording(False)
-            if self.asio_worker_stop is not None:
-                self.asio_worker_stop.set()
-            if self.asio_worker_wakeup is not None:
-                self.asio_worker_wakeup.set()
-            duplex_stream = (
-                self.stream
-                if self.stream is not None
-                and self.stream is not self.input_stream
-                and self.stream is not self.output_stream
-                else None
-            )
+            if self.native_worker_stop is not None:
+                self.native_worker_stop.set()
+            if self.native_worker_wakeup is not None:
+                self.native_worker_wakeup.set()
             for stream_name in ("input_stream", "output_stream"):
                 stream = getattr(self, stream_name, None)
                 if stream is not None:
                     stream.abort()
                     stream.close()
                     setattr(self, stream_name, None)
-            if duplex_stream is not None:
-                duplex_stream.abort()
-                duplex_stream.close()
             self.stream = None
             self.output_queue = None
-            self.asio_input_fifo = None
-            if self.asio_worker is not None and self.asio_worker.is_alive():
-                self.asio_worker.join(timeout=0.5)
-            self.asio_worker = None
-            self.asio_worker_stop = None
-            self.asio_worker_wakeup = None
-            self.asio_duplex_main_channels = 0
-            self.asio_duplex_monitor_channels = 0
+            self.native_input_fifo = None
+            if self.native_worker is not None and self.native_worker.is_alive():
+                self.native_worker.join(timeout=0.5)
+            self.native_worker = None
+            self.native_worker_stop = None
+            self.native_worker_wakeup = None
             if hasattr(self, "window"):
                 self.window["input_level_meter"].update(0.0)
                 self.window["output_level_meter"].update(0.0)
@@ -3017,31 +2777,20 @@ if __name__ == "__main__":
 
         @staticmethod
         def friendly_device_label(api_name, device_name, direction):
-            lower_name = device_name.lower()
-            if "voicemeeter" in lower_name:
-                if api_name == "ASIO":
-                    return f"[Voicemeeter ASIO] {device_name}"
-                if direction == "input":
-                    return f"[Voicemeeter] {device_name} → RVC入力"
-                return f"[Voicemeeter] {device_name} ← RVC出力"
-            api_label = "WASAPI" if api_name == "Windows WASAPI" else api_name
-            return f"[{api_label}] {device_name}"
+            return f"[{HOSTAPI_LABELS.get(api_name, api_name)}] {device_name}"
 
         @staticmethod
         def device_sort_key(label):
-            lower_label = label.lower()
-            if "voicemeeter" in lower_label:
+            if label.startswith("[JACK]"):
                 priority = 0
-            elif " ASIO" in label or "ASIO Link Pro Native" in label:
+            elif label.startswith("[ALSA]"):
                 priority = 1
-            elif label.startswith("[WASAPI]"):
-                priority = 2
             else:
-                priority = 3
-            return priority, lower_label
+                priority = 2
+            return priority, label.lower()
 
         def update_devices(self, hostapi_name=None, show_legacy=False):
-            """すべてのAPIから入出力デバイスを列挙する。"""
+            """List JACK (PipeWire) endpoints plus PipeWire's ALSA PCMs."""
             global flag_vc
             flag_vc = False
             sd._terminate()
@@ -3057,89 +2806,47 @@ if __name__ == "__main__":
             }
             self.input_device_map = {}
             self.output_device_map = {}
-            self.input_asio_selectors = {}
-            self.output_asio_selectors = {}
+            self.input_channel_selectors = {}
+            self.output_channel_selectors = {}
             self.device_names = {}
-            asio_link_inputs = []
-            asio_link_outputs = []
-            for endpoint in devices:
-                if endpoint["hostapi_name"] != "Windows WASAPI":
-                    continue
-                endpoint_name = endpoint["name"]
-                if "asiovadpro" not in endpoint_name.lower():
-                    continue
-                input_match = re.match(r"Mix\s*0*(\d+)", endpoint_name, re.I)
-                output_match = re.match(
-                    r"Speakers\s*0*(\d+)", endpoint_name, re.I
-                )
-                if input_match and endpoint["max_input_channels"] > 0:
-                    asio_link_inputs.append(
-                        (int(input_match.group(1)), endpoint_name)
-                    )
-                if output_match and endpoint["max_output_channels"] > 0:
-                    asio_link_outputs.append(
-                        (int(output_match.group(1)), endpoint_name)
-                    )
-            asio_link_inputs.sort()
-            asio_link_outputs.sort()
             for index, device in enumerate(devices):
                 api_name = device["hostapi_name"]
-                if not show_legacy and api_name not in ("ASIO", "Windows WASAPI"):
+                # Raw ALSA hw:* devices are normally held open by PipeWire,
+                # so only its shared PCMs are offered unless asked otherwise.
+                if not show_legacy and not (
+                    api_name == JACK_API
+                    or (api_name == ALSA_API and device["name"] in ALSA_SHARED_PCMS)
+                ):
                     continue
                 self.device_names[index] = device["name"]
-                if api_name == "ASIO":
-                    is_asio_link = "asio link pro" in device["name"].lower()
-                    if is_asio_link and asio_link_inputs:
-                        for endpoint_number, endpoint_name in asio_link_inputs:
-                            first_channel = 2 * (endpoint_number - 1)
-                            if first_channel + 1 >= device["max_input_channels"]:
-                                continue
-                            label = f"{endpoint_name.split(' (', 1)[0]} — ASIO Link Pro Native"
-                            self.input_device_map[label] = index
-                            self.input_asio_selectors[label] = [
-                                first_channel,
-                                first_channel + 1,
-                            ]
-                    else:
-                        for pair in self.channel_pairs(
-                            device["max_input_channels"]
-                        ):
-                            label = f"Input {pair} — {device['name']}"
-                            self.input_device_map[label] = index
-                            self.input_asio_selectors[label] = (
-                                self.parse_channel_pair(pair)
-                            )
-                    if is_asio_link and asio_link_outputs:
-                        for endpoint_number, endpoint_name in asio_link_outputs:
-                            first_channel = 2 * (endpoint_number - 1)
-                            if first_channel + 1 >= device["max_output_channels"]:
-                                continue
-                            label = f"{endpoint_name.split(' (', 1)[0]} — ASIO Link Pro Native"
-                            self.output_device_map[label] = index
-                            self.output_asio_selectors[label] = [
-                                first_channel,
-                                first_channel + 1,
-                            ]
-                    else:
-                        for pair in self.channel_pairs(
-                            device["max_output_channels"]
-                        ):
-                            label = f"Output {pair} — {device['name']}"
-                            self.output_device_map[label] = index
-                            self.output_asio_selectors[label] = (
-                                self.parse_channel_pair(pair)
-                            )
-                    continue
-                if device["max_input_channels"] > 0:
+                for direction, max_key, device_map, selector_map in (
+                    (
+                        "input",
+                        "max_input_channels",
+                        self.input_device_map,
+                        self.input_channel_selectors,
+                    ),
+                    (
+                        "output",
+                        "max_output_channels",
+                        self.output_device_map,
+                        self.output_channel_selectors,
+                    ),
+                ):
+                    channel_count = int(device[max_key])
+                    if channel_count <= 0:
+                        continue
                     label = self.friendly_device_label(
-                        api_name, device["name"], "input"
+                        api_name, device["name"], direction
                     )
-                    self.input_device_map[label] = index
-                if device["max_output_channels"] > 0:
-                    label = self.friendly_device_label(
-                        api_name, device["name"], "output"
-                    )
-                    self.output_device_map[label] = index
+                    if api_name != JACK_API:
+                        device_map[label] = index
+                        continue
+                    pairs = self.channel_pairs(channel_count)
+                    for pair in pairs:
+                        pair_label = label if len(pairs) == 1 else f"{label} — {pair}"
+                        device_map[pair_label] = index
+                        selector_map[pair_label] = self.parse_channel_pair(pair)
             self.input_devices = sorted(
                 self.input_device_map, key=self.device_sort_key
             )
@@ -3148,6 +2855,7 @@ if __name__ == "__main__":
             )
             self.input_devices_indices = list(self.input_device_map.values())
             self.output_devices_indices = list(self.output_device_map.values())
+
         def normalize_device_choice(self, saved_value, direction, saved_api=""):
             choices = (
                 self.input_device_map
@@ -3217,34 +2925,22 @@ if __name__ == "__main__":
             if self.file_source_active:
                 # A decoded file has no PortAudio input endpoint.  Binding
                 # the unused input side to the output endpoint prevents a
-                # stale/disabled microphone or ASIO driver from vetoing
-                # conversion startup.
+                # stale/disabled microphone from vetoing conversion startup.
                 input_index = output_index
                 input_api = "File"
             else:
                 input_index = self.input_device_map[input_device]
                 input_api = self.device_hostapis[input_index]
             output_api = self.device_hostapis[output_index]
-            if (
-                not self.file_source_active
-                and input_api == "ASIO"
-                and output_api == "ASIO"
-                and input_index != output_index
-            ):
-                raise ValueError(
-                    "異なるASIOドライバーを同時には使用できません。"
-                    if IS_JAPANESE_UI
-                    else "Two different ASIO drivers cannot be used at the same time."
-                )
             sd.default.device = (input_index, output_index)
             self.gui_config.sg_input_hostapi = input_api
             self.gui_config.sg_output_hostapi = output_api
-            self.asio_input_selectors = (
+            self.input_selectors = (
                 []
                 if self.file_source_active
-                else self.input_asio_selectors.get(input_device, [])
+                else self.input_channel_selectors.get(input_device, [])
             )
-            self.asio_output_selectors = self.output_asio_selectors.get(
+            self.output_selectors = self.output_channel_selectors.get(
                 output_device, []
             )
             self.monitor_device_index = (
@@ -3252,12 +2948,19 @@ if __name__ == "__main__":
                 if monitor_device == MONITOR_DISABLED
                 else self.output_device_map[monitor_device]
             )
-            if self.monitor_device_index == output_index:
+            self.monitor_selectors = self.output_channel_selectors.get(
+                monitor_device, []
+            )
+            if (
+                self.monitor_device_index == output_index
+                and self.monitor_selectors == self.output_selectors
+            ):
                 printt(
                     "Monitor output is the same as the main output; "
                     "the duplicate stream was omitted."
                 )
                 self.monitor_device_index = None
+                self.monitor_selectors = []
             self.gui_config.sg_monitor_hostapi = (
                 ""
                 if self.monitor_device_index is None
@@ -3272,32 +2975,6 @@ if __name__ == "__main__":
                 self.gui_config.sg_monitor_hostapi or "Disabled",
                 monitor_device,
             )
-            if input_api == "ASIO" or output_api == "ASIO":
-                printt(
-                    "ASIO driver open: input=%s output=%s",
-                    input_device if input_api == "ASIO" else "None",
-                    output_device if output_api == "ASIO" else "None",
-                )
-            self.asio_monitor_selectors = self.output_asio_selectors.get(
-                monitor_device, []
-            )
-            if self.asio_monitor_selectors == self.asio_output_selectors:
-                self.asio_monitor_selectors = []
-            if (
-                self.monitor_device_index is not None
-                and self.gui_config.sg_monitor_hostapi == "ASIO"
-                and self.monitor_device_index != output_index
-                and not (
-                    not self.file_source_active
-                    and input_api == "ASIO"
-                    and self.monitor_device_index == input_index
-                )
-            ):
-                raise ValueError(
-                    "ASIOモニターは、ASIO入力またはASIO出力と同じドライバーを選んでください。"
-                    if IS_JAPANESE_UI
-                    else "ASIO monitoring requires the same driver as the ASIO input or output."
-                )
             printt("Input device: %s:%s", str(sd.default.device[0]), input_device)
             printt("Output device: %s:%s", str(sd.default.device[1]), output_device)
             if self.monitor_device_index is not None:
@@ -3315,81 +2992,16 @@ if __name__ == "__main__":
         def get_automatic_samplerate(self, model_rate):
             """Use the active audio route's clock; RVC resamples as needed.
 
-            Virtual ASIO drivers such as ASIO Link Pro bridge Windows audio,
-            which commonly runs at 44.1 or 48 kHz.  Starting that driver at a
-            model's 40 kHz rate can work syntactically yet glitch when a
-            Windows audio source is active.  Prefer the route's actual common
-            rate; the model rate is only considered as a final fallback.
+            JACK endpoints run at the PipeWire graph rate (usually 48 kHz), so
+            the devices' own rates are tried first and the model rate is only
+            a final fallback.
             """
             return self.get_routing_samplerate(preferred_rates=[model_rate])
 
         def get_routing_samplerate(self, preferred_rates=()):
-            """Find a sample rate that every active stream can actually open.
-
-            A mixed ASIO/WASAPI route cannot use the input device's rate
-            blindly: virtual outputs frequently default to 48 kHz while an
-            interface input defaults to 44.1 kHz.  The streams still share one
-            RVC processing clock, so negotiate a common supported rate first.
-            """
+            """Find a sample rate that every active stream can actually open."""
             input_info = sd.query_devices(device=sd.default.device[0])
             output_info = sd.query_devices(device=sd.default.device[1])
-
-            def check_endpoint(
-                checker,
-                device,
-                channels,
-                api_name,
-                rate,
-                asio_selectors=None,
-            ):
-                if api_name == "ASIO":
-                    extra = sd.AsioSettings(
-                        channel_selectors=asio_selectors or []
-                    )
-                    checker(
-                        device=device,
-                        channels=channels,
-                        dtype="float32",
-                        samplerate=rate,
-                        extra_settings=extra,
-                    )
-                    return extra, False
-
-                if (
-                    "WASAPI" in api_name
-                    and self.gui_config.sg_wasapi_exclusive
-                ):
-                    exclusive = sd.WasapiSettings(exclusive=True)
-                    try:
-                        checker(
-                            device=device,
-                            channels=channels,
-                            dtype="float32",
-                            samplerate=rate,
-                            extra_settings=exclusive,
-                        )
-                        return exclusive, False
-                    except sd.PortAudioError:
-                        # Some Windows drivers expose a WASAPI endpoint but no
-                        # usable exclusive PCM format.  Keep the route usable
-                        # by falling back only that endpoint to shared mode.
-                        checker(
-                            device=device,
-                            channels=channels,
-                            dtype="float32",
-                            samplerate=rate,
-                            extra_settings=None,
-                        )
-                        return None, True
-
-                checker(
-                    device=device,
-                    channels=channels,
-                    dtype="float32",
-                    samplerate=rate,
-                    extra_settings=None,
-                )
-                return None, False
 
             candidates = []
             for rate in (
@@ -3404,90 +3016,49 @@ if __name__ == "__main__":
                 if rate > 0 and rate not in candidates:
                     candidates.append(rate)
 
+            checks = [
+                (
+                    sd.check_output_settings,
+                    sd.default.device[1],
+                    self.gui_config.output_channels,
+                )
+            ]
+            if not self.file_source_active:
+                checks.append(
+                    (
+                        sd.check_input_settings,
+                        sd.default.device[0],
+                        self.gui_config.channels,
+                    )
+                )
+            if self.monitor_device_index is not None:
+                checks.append(
+                    (
+                        sd.check_output_settings,
+                        self.monitor_device_index,
+                        self.stream_channels(
+                            self.monitor_device_index,
+                            "output",
+                            self.monitor_selectors,
+                        ),
+                    )
+                )
+
             errors = []
             for rate in candidates:
                 try:
-                    if self.file_source_active:
-                        input_extra, input_fallback = None, False
-                    else:
-                        input_extra, input_fallback = check_endpoint(
-                            sd.check_input_settings,
-                            sd.default.device[0],
-                            self.gui_config.channels,
-                            self.gui_config.sg_input_hostapi,
-                            rate,
-                            self.asio_input_selectors,
+                    for checker, device, channels in checks:
+                        checker(
+                            device=device,
+                            channels=channels,
+                            dtype="float32",
+                            samplerate=rate,
                         )
-                    output_extra, output_fallback = check_endpoint(
-                        sd.check_output_settings,
-                        sd.default.device[1],
-                        self.gui_config.output_channels,
-                        self.gui_config.sg_output_hostapi,
-                        rate,
-                        self.asio_output_selectors,
-                    )
-                    monitor_extra = None
-                    monitor_fallback = False
-                    if self.monitor_device_index is not None:
-                        monitor_info = sd.query_devices(self.monitor_device_index)
-                        if self.gui_config.sg_monitor_hostapi == "ASIO":
-                            # Selecting the same ASIO output for both Output
-                            # and Monitor is represented by no extra selectors;
-                            # it is already covered by the output check above.
-                            if self.asio_monitor_selectors:
-                                monitor_channels = len(
-                                    self.asio_monitor_selectors
-                                )
-                                monitor_extra, monitor_fallback = check_endpoint(
-                                    sd.check_output_settings,
-                                    self.monitor_device_index,
-                                    monitor_channels,
-                                    self.gui_config.sg_monitor_hostapi,
-                                    rate,
-                                    self.asio_monitor_selectors,
-                                )
-                        else:
-                            monitor_channels = min(
-                                int(monitor_info["max_output_channels"]), 2
-                            )
-                            monitor_extra, monitor_fallback = check_endpoint(
-                                sd.check_output_settings,
-                                self.monitor_device_index,
-                                monitor_channels,
-                                self.gui_config.sg_monitor_hostapi,
-                                rate,
-                            )
-
-                    self.input_wasapi_settings = (
-                        input_extra
-                        if "WASAPI" in self.gui_config.sg_input_hostapi
-                        else None
-                    )
-                    self.output_wasapi_settings = (
-                        output_extra
-                        if "WASAPI" in self.gui_config.sg_output_hostapi
-                        else None
-                    )
-                    self.monitor_wasapi_settings = (
-                        monitor_extra
-                        if "WASAPI" in self.gui_config.sg_monitor_hostapi
-                        else None
-                    )
-                    printt("Selected common sample rate: %s", rate)
-                    for fallback, device in (
-                        (input_fallback, sd.default.device[0]),
-                        (output_fallback, sd.default.device[1]),
-                        (monitor_fallback, self.monitor_device_index),
-                    ):
-                        if fallback and device is not None:
-                            printt(
-                                "WASAPI exclusive unavailable; shared fallback: %s",
-                                sd.query_devices(device)["name"],
-                            )
-                    return rate
                 except sd.PortAudioError as error:
                     errors.append(f"{rate} Hz: {error}")
                     continue
+                printt("Selected common sample rate: %s", rate)
+                return rate
 
             raise ValueError(
                 "The selected input, output, and monitor devices have no common sample rate. "
@@ -3495,20 +3066,22 @@ if __name__ == "__main__":
                 + "\n".join(errors[-3:])
             )
 
+        @staticmethod
+        def stream_channels(device, direction, selectors):
+            """Channels to open: enough to reach every selected JACK port."""
+            if selectors:
+                return max(selectors) + 1
+            max_key = "max_input_channels" if direction == "input" else "max_output_channels"
+            return min(int(sd.query_devices(device=device)[max_key]), 2)
+
         def get_device_channels(self):
-            if self.gui_config.sg_input_hostapi == "ASIO":
-                return len(self.asio_input_selectors)
-            return min(
-                int(sd.query_devices(device=sd.default.device[0])["max_input_channels"]),
-                2,
+            return self.stream_channels(
+                sd.default.device[0], "input", self.input_selectors
             )
 
         def get_output_channels(self):
-            if self.gui_config.sg_output_hostapi == "ASIO":
-                return len(self.asio_output_selectors)
-            return min(
-                int(sd.query_devices(device=sd.default.device[1])["max_output_channels"]),
-                2,
+            return self.stream_channels(
+                sd.default.device[1], "output", self.output_selectors
             )
 
     gui = GUI()

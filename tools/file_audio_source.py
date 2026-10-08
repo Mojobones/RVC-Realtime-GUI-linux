@@ -48,7 +48,6 @@ class FileAudioSource:
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                creationflags=subprocess.CREATE_NO_WINDOW,
                 timeout=15,
             )
             match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", completed.stderr)
@@ -139,7 +138,6 @@ class FileAudioSource:
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
-                    creationflags=subprocess.CREATE_NO_WINDOW,
                 )
             except OSError as error:
                 self._put(("error", str(error)))

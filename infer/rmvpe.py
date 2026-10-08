@@ -637,14 +637,16 @@ class RMVPE:
 if __name__ == "__main__":
     import librosa
     import soundfile as sf
+    import sys
 
-    audio, sampling_rate = sf.read(r"C:\Users\liujing04\Desktop\Z\冬之花clip1.wav")
+    # Usage: python -m infer.rmvpe <audio.wav> [rmvpe.pt]
+    audio, sampling_rate = sf.read(sys.argv[1])
     if len(audio.shape) > 1:
         audio = librosa.to_mono(audio.transpose(1, 0))
     audio_bak = audio.copy()
     if sampling_rate != 16000:
         audio = librosa.resample(audio, orig_sr=sampling_rate, target_sr=16000)
-    model_path = r"D:\BaiduNetdiskDownload\RVC-beta-v2-0727AMD_realtime\rmvpe.pt"
+    model_path = sys.argv[2] if len(sys.argv) > 2 else "assets/rmvpe/rmvpe.pt"
     thred = 0.03  # 0.01
     device = "cuda" if torch.cuda.is_available() else "cpu"
     rmvpe = RMVPE(model_path, is_half=False, device=device)

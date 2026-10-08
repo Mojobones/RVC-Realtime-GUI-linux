@@ -98,9 +98,21 @@ def _detect_directml():
 
 DML_AVAILABLE, DML_DEVICE = _detect_directml()
 
+def _gpu_throughput_key(profile):
+    """Rank eligible GPUs by SM count, then memory.
+
+    Compute capability alone prefers a newer low-end card (e.g. an RTX 5050
+    at SM 12.0) over a much faster older one (an RTX 4080 at SM 8.9).
+    """
+    device, _, _, mem_gb = profile
+    if device.type != "cuda":
+        return (-1, mem_gb)
+    return (torch.cuda.get_device_properties(device.index).multi_processor_count, mem_gb)
+
+
 if GPU_PROFILES:
     infer_device, infer_dtype, _, infer_gpu_mem = max(
-        GPU_PROFILES, key=lambda profile: (profile[2], profile[3])
+        GPU_PROFILES, key=_gpu_throughput_key
     )
 else:
     infer_device, infer_dtype, infer_gpu_mem = (

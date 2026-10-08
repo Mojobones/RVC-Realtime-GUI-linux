@@ -11,8 +11,13 @@
 
 <img width="1760" height="752" alt="RVC-Realtime-GUI screenshot" src="https://github.com/user-attachments/assets/d001d48b-9f00-4eeb-a90c-1474099e8454" />
 
-RVC-Realtime-GUI is a Windows desktop client for low-latency, real-time RVC
+RVC-Realtime-GUI is a desktop client for low-latency, real-time RVC
 (Retrieval-based Voice Conversion).
+
+> **This fork is a Linux port.** Audio runs through PortAudio on PipeWire:
+> **JACK (via pipewire-jack)** is the low-latency route that replaces ASIO, and
+> PipeWire's ALSA PCMs (`pipewire`, `default`) are the zero-setup fallback.
+> WASAPI, ASIO, and the Windows launchers have been removed.
 
 This repository contains the source for the **CUDA 12.8 standard build**.
 It is maintained as a focused derivative of
@@ -25,38 +30,78 @@ It is maintained as a focused derivative of
 - **CUDA Graph warm-up** to reduce steady-state GPU inference overhead
 - **Input/output noise-reduction fixes** from the updated real-time path
 - **CUDA 12.8 standard runtime**, including Blackwell-compatible environments
-- **Native ASIO buffer preservation**: opens ASIO with the driver's preferred
-  buffer size instead of allowing the high-latency default to select a larger
-  buffer
+- **Native JACK period handling**: JACK streams run at the PipeWire quantum
+  and are re-chunked to the RVC block size through a frame FIFO
 
-## Download
+## Linux setup
 
-**[Open the download page on Hugging Face](https://huggingface.co/niel-blue/RVC-Realtime-GUI)**
+### 1. System packages (Arch / CachyOS)
 
-| Build | Status | Intended hardware |
-| --- | --- | --- |
-| CUDA 12.8 | Current standard build | Current NVIDIA GPUs, including Blackwell-compatible environments |
-| CUDA 11.8 | legacy build | Older NVIDIA GPUs that cannot use the CUDA 12.8 package |
+```sh
+sudo pacman -S --needed portaudio pipewire-jack ffmpeg tk noto-fonts noto-fonts-cjk
+```
 
-Each package is self-contained and includes its Python runtime, PyTorch/CUDA
-stack, FFmpeg, inference assets, and the release model set.
+On other distributions, install the equivalents: PortAudio built with JACK
+support, PipeWire's JACK replacement, FFmpeg, Tk, and the Noto fonts.
 
-## Quick start
+### 2. Python environment
 
-1. Download and extract the matching package from the
-   [Hugging Face download page](https://huggingface.co/niel-blue/RVC-Realtime-GUI).
-2. Extract it to a short local path, such as `C:\RVC-Realtime-GUI`.
-   Do not run it from inside the archive.
-3. Start `RVC-Realtime-GUI-CUDA128.bat` for the CUDA 12.8 package.
-4. Select a model and audio devices, then press **Start**.
+Python **3.12** is required (`numpy==1.26.4` and `torch==2.7.1` do not support
+newer versions). With [uv](https://docs.astral.sh/uv/):
 
-> **First launch may take longer than usual** while the bundled inference assets
-> and GPU runtime are initialized. Please wait for the application window to
-> finish opening before assuming it has stopped responding.
+```sh
+uv venv --python 3.12 .venv
+uv pip install --python .venv/bin/python -r requirements_realtime_cuda128.txt \
+    --index-strategy unsafe-best-match
+```
+
+### 3. Inference assets
+
+The HuBERT and RMVPE weights are not stored in Git. Download the CUDA 12.8
+package from the
+[Hugging Face download page](https://huggingface.co/niel-blue/RVC-Realtime-GUI)
+and copy its `assets/` folder (and any `models/` you want) into this checkout:
+
+```text
+assets/
+  hubert_base/      # Transformers-format HuBERT/ContentVec (config.json, pytorch_model.bin)
+  rmvpe/rmvpe.pt
+```
+
+### 4. Run
+
+```sh
+./run.sh
+```
+
+FFmpeg is found on `PATH` (a binary at `tools/ffmpeg/ffmpeg` is used as a
+fallback).
+
+> **First launch may take longer than usual** while the inference assets and
+> GPU runtime are initialized.
+
+## Low-latency audio with JACK (PipeWire)
+
+Devices are listed as `[JACK] …` and `[ALSA] …`. JACK devices map one-to-one
+to PipeWire nodes; devices with more than two channels are offered per channel
+pair (for example `[JACK] My Interface — 3 / 4`).
+
+- The JACK period is the PipeWire quantum. Set it for the app only with
+  `PIPEWIRE_QUANTUM=128/48000 ./run.sh`, or for the whole graph with
+  `pw-metadata -n settings 0 clock.force-quantum 128`.
+- JACK streams follow the PipeWire graph rate (usually 48 kHz); RVC resamples
+  internally.
+- To send converted audio to Discord, OBS, and so on, route RVC's JACK ports
+  to a virtual sink with qpwgraph or Helvum, or select that sink as the output.
+- Watch for xruns with `pw-top`.
+
+On machines with several NVIDIA GPUs, **Automatic** selects the GPU with the
+most streaming multiprocessors; you can also pick one in the GPU menu or set
+`CUDA_VISIBLE_DEVICES`.
 
 ## Adding models
 
-Create one folder per model inside `models` in the extracted release package:
+Create one folder per model inside `models`:
 
 ```text
 models/
@@ -77,11 +122,11 @@ models/
 - Dedicated CustomTkinter desktop interface with Japanese and English UI
 - CUDA 12.8 standard build, including current NVIDIA GPU support
 - Real-time RVC inference with CUDA Graph warm-up
-- WASAPI and native ASIO audio-device routing
+- JACK (PipeWire) and ALSA audio-device routing with per-channel-pair selection
 - Independent input, output, and monitor device selection
 - Model gallery and model-specific general settings
 - WAV recording: separate input/output, mix, or split L/R recording
-- Audio-file input through bundled FFmpeg in the packaged release
+- Audio-file input through FFmpeg
 - Runtime-log display and log-file export
 
 ## Source layout
@@ -91,6 +136,7 @@ models/
 | `app/` | Application entry point and GUI |
 | `infer/` | RVC real-time inference, HuBERT, RMVPE, and FCPE code |
 | `tools/` | GUI adapter, audio routing, recording, file input, and helpers |
+| `run.sh` | Linux launcher (uses `.venv/`) |
 | `configs/config.py` | CUDA device and precision selection |
 | `models/README.md` | Model folder layout used by the packaged application |
 | `tests/` | Source-level regression tests |
@@ -100,25 +146,22 @@ models/
 The Git repository intentionally excludes all user-specific and large binary
 files:
 
-- Bundled Python runtime, PyTorch, CUDA libraries, and package cache
+- The Python virtual environment (`.venv/`), PyTorch, and CUDA libraries
 - RVC `.pth` models and FAISS `.index` files
 - HuBERT and RMVPE weight files
-- FFmpeg binaries
 - Audio recordings, logs, window position, and local device settings
 
-These files belong to the Hugging Face release package, not the source history.
+The weights come from the Hugging Face release package, not the source history.
 
 ## Development
 
-This source tree is intended for development of the packaged CUDA 12.8 build.
-Use the release package as the reference runtime, then run:
-
-```bat
-RVC-Realtime-GUI-CUDA128.bat
+```sh
+.venv/bin/python -m pytest tests
+./run.sh
 ```
 
-The package must contain `runtime/`, `assets/`, `tools/ffmpeg/`, and at least
-one model folder under `models/`.
+`README_ja.md` still describes the Windows build and has not been updated for
+the Linux port yet.
 
 ## Upstream and license
 

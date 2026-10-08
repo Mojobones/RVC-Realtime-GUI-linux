@@ -8,6 +8,7 @@ providing modern CustomTkinter widgets and thread-safe UI updates.
 from __future__ import annotations
 
 import queue
+import subprocess
 import locale
 import os
 import threading
@@ -25,7 +26,40 @@ _language = (
     or ""
 ).lower()
 IS_JAPANESE_UI = _language.startswith("ja")
-UI_FONT_FAMILY = "Yu Gothic UI" if IS_JAPANESE_UI else "Segoe UI"
+
+
+def _installed_font_families():
+    """Return fontconfig family names; an empty set lets Tk use its default."""
+    try:
+        completed = subprocess.run(
+            ["fc-list", ":", "family"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    families = set()
+    for line in completed.stdout.splitlines():
+        families.update(name.strip() for name in line.split(","))
+    return families
+
+
+def _first_font(candidates, installed):
+    return next((name for name in candidates if name in installed), candidates[-1])
+
+
+_INSTALLED_FONTS = _installed_font_families()
+UI_FONT_FAMILY = _first_font(
+    ("Noto Sans CJK JP", "Noto Sans", "DejaVu Sans")
+    if IS_JAPANESE_UI
+    else ("Noto Sans", "DejaVu Sans", "Cantarell"),
+    _INSTALLED_FONTS,
+)
+SYMBOL_FONT_FAMILY = _first_font(
+    ("DejaVu Sans", "Noto Sans Symbols 2", "Noto Sans Symbols", UI_FONT_FAMILY),
+    _INSTALLED_FONTS,
+)
 
 
 WINDOW_CLOSED = "__WINDOW_CLOSED__"

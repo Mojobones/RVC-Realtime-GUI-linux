@@ -1,5 +1,6 @@
 # Packaged runtime and generated user state
 runtime/
+.venv/
 logs/
 recordings/
 configs/config.json
