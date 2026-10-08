@@ -56,7 +56,8 @@ class RNNoise:
             raise RuntimeError("rnnoise_create failed")
         self._frame = np.zeros(FRAME_SIZE, dtype=np.float32)
         self._pointer = self._frame.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
-        self.last_voice_probability = 0.0
+        #: Voice probability of each 10 ms frame of the last ``process`` call.
+        self.voice_probabilities = np.zeros(0, dtype=np.float32)
 
     def process(self, audio):
         """Denoise float32 audio in [-1, 1] whose length is a multiple of 480."""
@@ -64,12 +65,14 @@ class RNNoise:
         if audio.shape[0] % FRAME_SIZE:
             raise ValueError(f"RNNoise needs a multiple of {FRAME_SIZE} samples")
         output = np.empty_like(audio)
-        probability = 0.0
-        for start in range(0, audio.shape[0], FRAME_SIZE):
+        probabilities = np.empty(audio.shape[0] // FRAME_SIZE, dtype=np.float32)
+        for index, start in enumerate(range(0, audio.shape[0], FRAME_SIZE)):
             self._frame[:] = audio[start : start + FRAME_SIZE] * _SCALE
-            probability = _LIBRARY.rnnoise_process_frame(self._state, self._pointer, self._pointer)
+            probabilities[index] = _LIBRARY.rnnoise_process_frame(
+                self._state, self._pointer, self._pointer
+            )
             output[start : start + FRAME_SIZE] = self._frame / _SCALE
-        self.last_voice_probability = float(probability)
+        self.voice_probabilities = probabilities
         return output
 
     def close(self):

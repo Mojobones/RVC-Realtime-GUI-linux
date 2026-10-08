@@ -81,8 +81,18 @@ class WsolaSplicer:
             return self.last_offset, confidence
         return int(best_offset), confidence
 
-    def splice(self, infer_wav):
-        """Crossfade ``infer_wav`` onto the previous chunk; return ``block`` samples."""
+    def splice(self, infer_wav, crossfade=True):
+        """Crossfade ``infer_wav`` onto the previous chunk; return ``block`` samples.
+
+        ``crossfade=False`` starts fresh after silence (no previous chunk to
+        join), so the head of the chunk is not faded in over 40 ms.
+        """
+        if not crossfade:
+            self.template.zero_()
+            self.last_offset, self.last_confidence = 0, 0.0
+            output = infer_wav
+            self.template[:] = output[self.block : self.block + self.fade]
+            return output[: self.block]
         offset, confidence = self.find_offset(infer_wav)
         self.last_offset, self.last_confidence = offset, confidence
         output = infer_wav[offset:]

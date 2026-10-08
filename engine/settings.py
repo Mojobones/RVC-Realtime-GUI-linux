@@ -18,6 +18,9 @@ DEFAULT_RECORDING_FOLDER = os.path.join(PROJECT_ROOT, "recordings")
 F0_METHODS = ("pm", "rmvpe", "fcpe")
 INPUT_SOURCES = ("microphone", "file")
 RECORDING_MODES = ("separate", "mix", "stereo")
+#: How context hold decides a block is silent: by loudness, or (experimental)
+#: by RNNoise's voice-activity probability.
+HOLD_DETECTORS = ("level", "voice")
 
 MODEL_SETTINGS_FILENAME = "realtime_settings.json"
 # Protocol name -> key stored in each model's realtime_settings.json.
@@ -62,6 +65,7 @@ class EngineSettings:
     input_denoise: bool = False
     #: Freeze the model's past context during silence (see engine/core.py).
     hold_context: bool = True
+    hold_detector: str = "level"
     output_denoise: bool = False
     # Keep the original real-time RVC defaults: no envelope post-processing
     # or index blending until the user enables them.
@@ -112,6 +116,7 @@ PERFORMANCE_DEFAULT_KEYS = (
     "input_denoise",
     "output_denoise",
     "hold_context",
+    "hold_detector",
     "rms_mix_rate",
     "f0method",
 )
@@ -159,6 +164,7 @@ def coerce_setting(key, value):
         "f0method": F0_METHODS,
         "input_source": INPUT_SOURCES,
         "recording_mode": RECORDING_MODES,
+        "hold_detector": HOLD_DETECTORS,
     }.get(key)
     if allowed and value not in allowed:
         raise SettingError(key, f"{key} must be one of {', '.join(allowed)}")

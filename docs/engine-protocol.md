@@ -80,6 +80,7 @@ translate by `code`.
 | `extra_time` | number (s) | restart |
 | `input_denoise` / `output_denoise` | bool | live; input uses RNNoise at 48 kHz when `librnnoise` is installed, otherwise spectral gating (TorchGate) |
 | `hold_context` | bool | live (default on): while every 10 ms frame of a block is below −50 dBFS (or the noise gate, if higher), conversion emits silence and skips inference, so the model's past context survives the pause |
+| `hold_detector` | `"level"` \| `"voice"` | live (default `"level"`): how context hold detects silence. `"voice"` (experimental) uses RNNoise's voice-activity probability, which ignores steady room noise; it needs RNNoise at 48 kHz and falls back to `"level"` otherwise |
 | `rms_mix_rate` | number 0–1 | live (volume envelope) |
 | `f0method` | `"pm"` \| `"rmvpe"` \| `"fcpe"` | live |
 | `recording_folder` | string | live |

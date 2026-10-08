@@ -43,6 +43,49 @@ def rmvpe_window(block_frame_16k, available):
     return max(min(window, largest), min(minimum, available))
 
 
+#: Longest unvoiced run (10 ms frames) treated as a pitch-detector dropout and
+#: bridged; longer runs stay unvoiced so the synthesiser renders them as noise.
+#: tools/consonant_bench.py on real speech (streaming RMVPE): 3-5 frames cut
+#: forced pitch on consonants/breaths most (28% -> 18%) but left 1.6-2% of
+#: vowel frames unvoiced (audible breaks); 8 frames cut it to 22% with voiced
+#: frames unchanged within the noise floor.
+MAX_F0_GAP_FRAMES = 8
+#: Restore the old behaviour (every frame voiced); for benchmarks only.
+FULL_F0_INTERPOLATION = False
+
+
+def fill_short_gaps(f0, max_gap=None):
+    """Bridge brief unvoiced dropouts inside voiced speech; keep the rest unvoiced.
+
+    Runs of at most ``max_gap`` zero frames with voiced frames on both sides
+    are filled by interpolating in log-frequency.  Longer runs, and runs that
+    touch either end of the analysis window, stay 0 so RVC's NSF source uses
+    noise for them (breaths, s/sh/f/t/h) instead of a forced pitch.
+    """
+    if max_gap is None:
+        max_gap = MAX_F0_GAP_FRAMES
+    f0 = np.array(f0, dtype=np.float64)  # a copy; the caller's array is untouched
+    voiced = f0 > 0
+    if FULL_F0_INTERPOLATION:
+        if np.any(voiced):
+            f0[~voiced] = np.interp(np.where(~voiced)[0], np.where(voiced)[0], f0[voiced])
+        return f0
+    index, length = 0, f0.shape[0]
+    while index < length:
+        if voiced[index]:
+            index += 1
+            continue
+        end = index
+        while end < length and not voiced[end]:
+            end += 1
+        if index > 0 and end < length and end - index <= max_gap:
+            left, right = np.log(f0[index - 1]), np.log(f0[end])
+            steps = np.arange(1, end - index + 1) / (end - index + 1)
+            f0[index:end] = np.exp(left + (right - left) * steps)
+        index = end
+    return f0
+
+
 def get_synthesizer(pth_path, device=torch.device("cpu")):
     from infer.module.models import (
         SynthesizerTrnMs256NSFsid,
@@ -204,9 +247,7 @@ class RVC:
         if len(f0) < p_len:
             f0 = np.pad(f0, (0, p_len - len(f0)))
         f0 = f0[:p_len]
-        uv = f0 == 0
-        if np.any(~uv):
-            f0[uv] = np.interp(np.where(uv)[0], np.where(~uv)[0], f0[~uv])
+        f0 = fill_short_gaps(f0)
         f0 *= pow(2, f0_up_key / 12)
         return self.get_f0_post(f0)
 
@@ -221,9 +262,7 @@ class RVC:
                 device=self.device,
             )
         f0 = self.model_rmvpe.infer_from_audio(x, thred=0.03)
-        uv = f0 == 0
-        if np.any(~uv):
-            f0[uv] = np.interp(np.where(uv)[0], np.where(~uv)[0], f0[~uv])
+        f0 = fill_short_gaps(f0)
         f0 *= pow(2, f0_up_key / 12)
         return self.get_f0_post(f0)
 
@@ -239,9 +278,7 @@ class RVC:
             decoder_mode="local_argmax",
             threshold=0.006,
         ).squeeze().detach().cpu().numpy()
-        uv = f0 == 0
-        if np.any(~uv):
-            f0[uv] = np.interp(np.where(uv)[0], np.where(~uv)[0], f0[~uv])
+        f0 = fill_short_gaps(f0)
         f0 *= pow(2, f0_up_key / 12)
         return self.get_f0_post(f0)
 

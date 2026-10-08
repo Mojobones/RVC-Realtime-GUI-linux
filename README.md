@@ -177,8 +177,10 @@ cargo test --manifest-path ui/Cargo.toml         # interface
 
 **Context hold** (Performance → *Hold context during silence*, on by
 default) stops silence from pushing your last words out of the model's
-context, so the first word after a pause isn't slurred. To measure it on your
-own model and voice:
+context, so the first word after a pause isn't slurred. In a noisy room, set
+*Silence detection* to *Voice detection (experimental)*: RNNoise then decides
+when you are speaking, so fan or hum noise doesn't count as speech. To measure
+it on your own model and voice:
 
 ```sh
 .venv/bin/python -m tools.context_bench --model "My Voice" --input speech.wav

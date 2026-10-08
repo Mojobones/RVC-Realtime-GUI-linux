@@ -184,6 +184,7 @@ impl Toggle {
 
 pub const F0_METHODS: [&str; 3] = ["rmvpe", "fcpe", "pm"];
 pub const RECORDING_MODES: [&str; 3] = ["separate", "mix", "stereo"];
+pub const HOLD_DETECTORS: [&str; 2] = ["level", "voice"];
 pub const INPUT_SOURCES: [&str; 2] = ["microphone", "file"];
 
 /// Connection to the engine process, as shown to the user.
@@ -224,6 +225,7 @@ pub enum Message {
     SelectMonitor(usize),
     SelectF0(usize),
     SelectRecordingMode(usize),
+    SelectHoldDetector(usize),
     Run(Function),
     Reset(&'static str),
     ReloadModels,
@@ -281,6 +283,7 @@ pub struct App {
     pub source_labels: Vec<String>,
     pub f0_labels: Vec<String>,
     pub recording_mode_labels: Vec<String>,
+    pub hold_detector_labels: Vec<String>,
 }
 
 impl cosmic::Application for App {
@@ -344,6 +347,7 @@ impl cosmic::Application for App {
             monitor_labels: Vec::new(),
             source_labels: vec![fl!("source-microphone"), fl!("source-file")],
             f0_labels: vec![fl!("f0-rmvpe"), fl!("f0-fcpe"), fl!("f0-pm")],
+            hold_detector_labels: vec![fl!("hold-detector-level"), fl!("hold-detector-voice")],
             recording_mode_labels: vec![
                 fl!("recording-separate"),
                 fl!("recording-mix"),
@@ -457,6 +461,9 @@ impl cosmic::Application for App {
                 self.send_setting("monitor_device", value);
             }
             Message::SelectF0(index) => self.send_setting("f0method", json!(F0_METHODS[index])),
+            Message::SelectHoldDetector(index) => {
+                self.send_setting("hold_detector", json!(HOLD_DETECTORS[index]));
+            }
             Message::SelectRecordingMode(index) => {
                 self.send_setting("recording_mode", json!(RECORDING_MODES[index]));
             }

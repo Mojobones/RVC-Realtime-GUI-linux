@@ -69,6 +69,9 @@ HOLD_THRESHOLD_DB = -50.0
 #: RNNoise's own output delay: one 10 ms frame of buffering plus its 10 ms
 #: window overlap (960 samples, measured on real speech; tests/test_rnnoise.py).
 RNNOISE_DELAY_SECONDS = 0.020
+#: Voice-activity probability below which a block counts as silence when the
+#: experimental voice detector is selected (tools/rnnoise.py).
+VOICE_THRESHOLD = 0.5
 #: Fade-in after the stale output that follows a held pause.
 RESUME_RAMP_SECONDS = 0.005
 FUNCTIONS = {"vc": "vc", "passthrough": "im"}
@@ -681,8 +684,12 @@ class RealtimeEngine:
         # Input noise reduction: RNNoise when the library is installed and the
         # stream runs at its 48 kHz rate; TorchGate spectral gating otherwise.
         self.rnnoise = None
+        # A separate instance for voice detection: RNNoise is stateful and must
+        # see each block exactly once, in order, for each job.
+        self.vad = None
         if rnnoise.available() and self.samplerate == rnnoise.SAMPLE_RATE:
             self.rnnoise = rnnoise.RNNoise()
+            self.vad = rnnoise.RNNoise()
         printt(
             "Input noise reduction: %s",
             "RNNoise"
@@ -690,8 +697,13 @@ class RealtimeEngine:
             else "spectral gate (RNNoise %s)"
             % ("needs 48 kHz" if rnnoise.available() else "not installed"),
         )
+        if self.settings.hold_detector == "voice" and self.vad is None:
+            printt("Silence detection: voice detection needs RNNoise at 48 kHz; using loudness")
         self.seam_confidences = []
         self.context_held = False
+        self.held_block = None
+        #: Internal switch for benchmarks; pre-roll is always on in the app.
+        self.pre_roll = getattr(self, "pre_roll", True)
         self.stale_samples = 0
         ramp = max(1, int(RESUME_RAMP_SECONDS * self.samplerate))
         self.resume_ramp = torch.linspace(
@@ -977,74 +989,14 @@ class RealtimeEngine:
             self.latest_input_meter = peak_meter(indata)
             self.last_input_meter_update = meter_now
         if self.function == "vc" and settings.hold_context and self.block_is_silent(indata):
+            # Keep the latest held block: if detection was late, the start of
+            # the next word is in it (pre-roll, see resume_from_hold).
+            self.held_block = indata.copy() if self.pre_roll else None
             return self.hold_silence(start_time)
-        if self.context_held:
-            # Resuming after a held pause: the head of this chunk's output
-            # window still holds the frozen context (the end of the previous
-            # word), which must not be replayed.
-            self.context_held = False
-            self.stale_samples = self.splicer.input_length - self.block_frame
-        if settings.noise_gate_db > -60:
-            indata = np.append(self.rms_buffer, indata)
-            rms = librosa.feature.rms(
-                y=indata, frame_length=4 * self.zc, hop_length=self.zc
-            )[:, 2:]
-            self.rms_buffer[:] = indata[-4 * self.zc :]
-            indata = indata[2 * self.zc - self.zc // 2 :]
-            db_threhold = (
-                librosa.amplitude_to_db(rms, ref=1.0)[0] < settings.noise_gate_db
-            )
-            for i in range(db_threhold.shape[0]):
-                if db_threhold[i]:
-                    indata[i * self.zc : (i + 1) * self.zc] = 0
-            indata = indata[self.zc // 2 :]
-        self.input_wav[: -self.block_frame] = self.input_wav[self.block_frame :].clone()
-        self.input_wav[-indata.shape[0] :] = torch.from_numpy(indata).to(self.config.device)
-        self.input_wav_res[: -self.block_frame_16k] = self.input_wav_res[
-            self.block_frame_16k :
-        ].clone()
-        # input noise reduction and resampling
-        if settings.input_denoise:
-            self.input_wav_denoise[: -self.block_frame] = self.input_wav_denoise[
-                self.block_frame :
-            ].clone()
-        if settings.input_denoise and self.rnnoise is not None:
-            # RNNoise keeps a recurrent state, so it sees each block once, in order.
-            denoised = self.rnnoise.process(indata)
-            self.input_wav_denoise[-self.block_frame :] = torch.from_numpy(denoised).to(
-                self.config.device
-            )
-            resample_input = self.input_wav_denoise[-self.block_frame - 2 * self.zc :]
-            self.input_wav_res[-self.block_frame_16k - 160 :] = run_cuda_graph(
-                self.resampler,
-                "realtime-input-resample",
-                lambda audio: self.resampler(audio),
-                resample_input,
-            )[160:]
-        elif settings.input_denoise:
-            input_wav = self.input_wav[-self.fade_frame - self.block_frame :]
-            input_wav = self.tg(
-                input_wav.unsqueeze(0), self.input_wav.unsqueeze(0)
-            ).squeeze(0)
-            input_wav[: self.fade_frame] *= self.splicer.fade_in
-            input_wav[: self.fade_frame] += self.nr_buffer * self.splicer.fade_out
-            self.input_wav_denoise[-self.block_frame :] = input_wav[: self.block_frame]
-            self.nr_buffer[:] = input_wav[self.block_frame :]
-            resample_input = self.input_wav_denoise[-self.block_frame - 2 * self.zc :]
-            self.input_wav_res[-self.block_frame_16k - 160 :] = run_cuda_graph(
-                self.resampler,
-                "realtime-input-resample",
-                lambda audio: self.resampler(audio),
-                resample_input,
-            )[160:]
-        else:
-            resample_input = self.input_wav[-indata.shape[0] - 2 * self.zc :]
-            self.input_wav_res[-160 * (indata.shape[0] // self.zc + 1) :] = run_cuda_graph(
-                self.resampler,
-                "realtime-input-resample",
-                lambda audio: self.resampler(audio),
-                resample_input,
-            )[160:]
+        resumed = self.context_held
+        if resumed:
+            self.resume_from_hold()
+        self.ingest_block(indata)
         # infer
         if self.function == "vc":
             infer_wav = self.rvc.infer(
@@ -1110,10 +1062,11 @@ class RealtimeEngine:
             self.chunk_tap(infer_wav)
         # WSOLA: align with the previous chunk's natural continuation and
         # crossfade over a fixed 40 ms (tools/splice.py).
-        infer_wav = self.splicer.splice(infer_wav)
-        self.record_seam(self.splicer.last_confidence)
-        if self.stale_samples > 0:
-            self.mute_stale_output(infer_wav)
+        infer_wav = self.splicer.splice(infer_wav, crossfade=not resumed)
+        if not resumed:
+            self.record_seam(self.splicer.last_confidence)
+        if resumed or self.stale_samples > 0:
+            self.mute_stale_output(infer_wav, ramp=resumed)
         return self.finish_block(infer_wav, start_time)
 
     def input_denoise_delay(self):
@@ -1122,7 +1075,117 @@ class RealtimeEngine:
             return RNNOISE_DELAY_SECONDS
         return FADE_SECONDS
 
+    def ingest_block(self, indata):
+        """Write one input block into the context: noise gate, denoise, resample."""
+        settings = self.settings
+        if settings.noise_gate_db > -60:
+            indata = np.append(self.rms_buffer, indata)
+            rms = librosa.feature.rms(
+                y=indata, frame_length=4 * self.zc, hop_length=self.zc
+            )[:, 2:]
+            self.rms_buffer[:] = indata[-4 * self.zc :]
+            indata = indata[2 * self.zc - self.zc // 2 :]
+            db_threhold = (
+                librosa.amplitude_to_db(rms, ref=1.0)[0] < settings.noise_gate_db
+            )
+            for i in range(db_threhold.shape[0]):
+                if db_threhold[i]:
+                    indata[i * self.zc : (i + 1) * self.zc] = 0
+            indata = indata[self.zc // 2 :]
+        self.input_wav[: -self.block_frame] = self.input_wav[self.block_frame :].clone()
+        self.input_wav[-indata.shape[0] :] = torch.from_numpy(indata).to(self.config.device)
+        self.input_wav_res[: -self.block_frame_16k] = self.input_wav_res[
+            self.block_frame_16k :
+        ].clone()
+        # input noise reduction and resampling
+        if settings.input_denoise:
+            self.input_wav_denoise[: -self.block_frame] = self.input_wav_denoise[
+                self.block_frame :
+            ].clone()
+        if settings.input_denoise and self.rnnoise is not None:
+            # RNNoise keeps a recurrent state, so it sees each block once, in order.
+            denoised = self.rnnoise.process(indata)
+            self.input_wav_denoise[-self.block_frame :] = torch.from_numpy(denoised).to(
+                self.config.device
+            )
+            resample_input = self.input_wav_denoise[-self.block_frame - 2 * self.zc :]
+            self.input_wav_res[-self.block_frame_16k - 160 :] = run_cuda_graph(
+                self.resampler,
+                "realtime-input-resample",
+                lambda audio: self.resampler(audio),
+                resample_input,
+            )[160:]
+        elif settings.input_denoise:
+            input_wav = self.input_wav[-self.fade_frame - self.block_frame :]
+            input_wav = self.tg(
+                input_wav.unsqueeze(0), self.input_wav.unsqueeze(0)
+            ).squeeze(0)
+            input_wav[: self.fade_frame] *= self.splicer.fade_in
+            input_wav[: self.fade_frame] += self.nr_buffer * self.splicer.fade_out
+            self.input_wav_denoise[-self.block_frame :] = input_wav[: self.block_frame]
+            self.nr_buffer[:] = input_wav[self.block_frame :]
+            resample_input = self.input_wav_denoise[-self.block_frame - 2 * self.zc :]
+            self.input_wav_res[-self.block_frame_16k - 160 :] = run_cuda_graph(
+                self.resampler,
+                "realtime-input-resample",
+                lambda audio: self.resampler(audio),
+                resample_input,
+            )[160:]
+        else:
+            resample_input = self.input_wav[-indata.shape[0] - 2 * self.zc :]
+            self.input_wav_res[-160 * (indata.shape[0] // self.zc + 1) :] = run_cuda_graph(
+                self.resampler,
+                "realtime-input-resample",
+                lambda audio: self.resampler(audio),
+                resample_input,
+            )[160:]
+
+    def resume_from_hold(self):
+        """Resume after a held pause, pre-rolling the last held block.
+
+        Silence detection can be late (voice detection reports 20 ms behind),
+        so the start of a word may sit in the last held block.  Writing that
+        block into the context before the current one makes this chunk's
+        output window start on real audio, exactly as without a hold, so the
+        attack is converted instead of clipped.
+        """
+        self.context_held = False
+        held, self.held_block = self.held_block, None
+        fresh = self.block_frame
+        if held is not None:
+            self.ingest_block(held)
+            self.shift_pitch_cache()
+            fresh += self.block_frame
+        # Only blocks shorter than the 50 ms fade + search span can still
+        # reach into frozen context (the end of the previous word).
+        self.stale_samples = max(0, self.splicer.input_length - fresh)
+
+    def shift_pitch_cache(self):
+        """Advance the RVC pitch cache by one block, as an inference would."""
+        shift = self.block_frame_16k // 160
+        for name in ("cache_pitch", "cache_pitchf"):
+            cache = getattr(self.rvc, name, None)
+            if cache is not None:
+                cache[:-shift] = cache[shift:].clone()
+
     def block_is_silent(self, mono):
+        """Whether context hold should treat this block as silence."""
+        if self.settings.hold_detector == "voice" and self.vad is not None:
+            return self.block_has_no_voice(mono)
+        return self.block_is_quiet(mono)
+
+    def block_has_no_voice(self, mono):
+        """Experimental: RNNoise's voice probability stays low for the block.
+
+        Unlike loudness this ignores steady room noise (fans, hum), so the hold
+        also works in noisy rooms.  RNNoise reports each frame 20 ms late; a word
+        starting in a block's last 20 ms is recovered by the pre-roll in
+        resume_from_hold.
+        """
+        self.vad.process(mono)
+        return bool(np.max(self.vad.voice_probabilities) < VOICE_THRESHOLD)
+
+    def block_is_quiet(self, mono):
         """True when every 10 ms frame of the block is below the hold level."""
         threshold_db = max(self.settings.noise_gate_db, HOLD_THRESHOLD_DB)
         frames = mono[: (mono.shape[0] // self.zc) * self.zc].reshape(-1, self.zc)
@@ -1147,12 +1210,13 @@ class RealtimeEngine:
             self.splicer.reset()
         return self.finish_block(output, start_time)
 
-    def mute_stale_output(self, output):
-        """Silence output taken from frozen context, then fade in."""
+    def mute_stale_output(self, output, ramp=True):
+        """Silence output taken from frozen context, then fade in from silence."""
         muted = min(self.block_frame, max(0, self.stale_samples - self.splicer.last_offset))
         output[:muted] = 0
-        ramp = min(self.resume_ramp.shape[0], self.block_frame - muted)
-        output[muted : muted + ramp] *= self.resume_ramp[:ramp]
+        if ramp:
+            length = min(self.resume_ramp.shape[0], self.block_frame - muted)
+            output[muted : muted + length] *= self.resume_ramp[:length]
         self.stale_samples = max(0, self.stale_samples - self.block_frame)
 
     def finish_block(self, output, start_time):

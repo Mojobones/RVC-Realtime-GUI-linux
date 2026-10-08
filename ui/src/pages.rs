@@ -5,8 +5,8 @@ use cosmic::prelude::*;
 use cosmic::widget::{self, settings};
 
 use crate::app::{
-    App, Connection, F0_METHODS, Function, INPUT_SOURCES, Message, Num, Page, RECORDING_MODES,
-    Toggle, VALUE_INPUT_ID,
+    App, Connection, F0_METHODS, Function, HOLD_DETECTORS, INPUT_SOURCES, Message, Num, Page,
+    RECORDING_MODES, Toggle, VALUE_INPUT_ID,
 };
 use crate::engine::State;
 use crate::fl;
@@ -461,6 +461,21 @@ fn performance_page<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> 
                     .toggler(settings_.hold_context, |value| {
                         Message::Toggle(Toggle::HoldContext, value)
                     }),
+            )
+            .add(
+                settings::item::builder(fl!("hold-detector"))
+                    .description(if settings_.hold_detector == "voice" {
+                        fl!("hold-detector-voice-detail")
+                    } else {
+                        fl!("hold-detector-level-detail")
+                    })
+                    .control(widget::dropdown(
+                        &app.hold_detector_labels,
+                        HOLD_DETECTORS
+                            .iter()
+                            .position(|detector| *detector == settings_.hold_detector),
+                        Message::SelectHoldDetector,
+                    )),
             )
             .into(),
         settings::section()

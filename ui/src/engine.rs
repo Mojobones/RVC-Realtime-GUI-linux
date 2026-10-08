@@ -57,6 +57,8 @@ pub struct Settings {
     pub input_denoise: bool,
     pub output_denoise: bool,
     pub hold_context: bool,
+    #[serde(default = "default_hold_detector")]
+    pub hold_detector: String,
     pub rms_mix_rate: f32,
     pub f0method: String,
     pub recording_folder: String,
@@ -69,6 +71,10 @@ pub struct Settings {
     pub pitch: f32,
     pub formant: f32,
     pub index_rate: f32,
+}
+
+fn default_hold_detector() -> String {
+    "level".to_string()
 }
 
 #[derive(Clone, Debug, Deserialize)]

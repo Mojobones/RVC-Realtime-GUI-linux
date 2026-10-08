@@ -6,12 +6,14 @@ output exact: the input delayed by the 50 ms fade plus search span.
 
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 import torch
 
 from engine.core import RealtimeEngine
-from engine.settings import EngineSettings
+from engine.settings import EngineSettings, SettingError, coerce_setting
+from tools import rnnoise
 from tools.wav_recorder import WavRecorder
 
 RATE = 48000
@@ -132,3 +134,114 @@ class ContextHoldTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def fan_noise(seconds, level_db, rng):
+    """Steady low-passed noise, like a fan or air conditioner."""
+    white = rng.standard_normal(int(seconds * RATE))
+    noise = np.zeros_like(white)
+    alpha = np.exp(-2 * np.pi * 300 / RATE)
+    for i in range(1, white.shape[0]):
+        noise[i] = alpha * noise[i - 1] + (1 - alpha) * white[i]
+    return (noise / np.std(noise) * 10 ** (level_db / 20)).astype(np.float32)
+
+
+def voice_like(seconds, f0=140.0):
+    t = np.arange(int(seconds * RATE)) / RATE
+    tone = sum(np.sin(2 * np.pi * k * f0 * t) / k for k in range(1, 20))
+    return (0.1 * tone * (0.5 + 0.5 * np.sin(2 * np.pi * 3.0 * t) ** 2)).astype(np.float32)
+
+
+class HoldDetectorTest(unittest.TestCase):
+    def noisy_pause(self):
+        rng = np.random.default_rng(6)
+        room = fan_noise(6.0, -35.0, rng)  # far above the -50 dB loudness threshold
+        room[: RATE] += voice_like(1.0)
+        room[5 * RATE :] += voice_like(1.0)
+        return room
+
+    def held_blocks_during_pause(self, detector):
+        engine = engine_with_identity_model(hold_context=True)
+        engine.settings.hold_detector = detector
+        signal = self.noisy_pause()
+        block = engine.block_frame
+        held = 0
+        for start in range(0, signal.shape[0], block):
+            engine.audio_callback(signal[start : start + block, None].copy(), block, None, None)
+            if 1.5 * RATE <= start < 4.5 * RATE:
+                held += engine.context_held
+        return held, int(3.0 * RATE / block)
+
+    @unittest.skipUnless(rnnoise.available(), "librnnoise not installed")
+    def test_loudness_never_holds_in_a_noisy_room(self):
+        held, total = self.held_blocks_during_pause("level")
+        self.assertEqual(held, 0)
+
+    @unittest.skipUnless(rnnoise.available(), "librnnoise not installed")
+    def test_voice_detection_holds_through_room_noise(self):
+        held, total = self.held_blocks_during_pause("voice")
+        self.assertGreaterEqual(held, 0.8 * total)
+
+    @unittest.skipUnless(rnnoise.available(), "librnnoise not installed")
+    def test_voice_detection_does_not_hold_speech(self):
+        engine = engine_with_identity_model(hold_context=True)
+        engine.settings.hold_detector = "voice"
+        speech = voice_like(2.0)
+        block = engine.block_frame
+        held = []
+        for start in range(0, speech.shape[0], block):
+            engine.audio_callback(speech[start : start + block, None].copy(), block, None, None)
+            held.append(engine.context_held)
+        self.assertFalse(any(held[5:]))  # after RNNoise settles
+
+    def test_voice_detection_falls_back_to_loudness_without_rnnoise(self):
+        with mock.patch.object(rnnoise, "available", return_value=False):
+            engine = engine_with_identity_model(hold_context=True)
+        engine.settings.hold_detector = "voice"
+        self.assertIsNone(engine.vad)
+        quiet = np.zeros(engine.block_frame, dtype=np.float32)
+        loud = np.full(engine.block_frame, 0.1, dtype=np.float32)
+        self.assertTrue(engine.block_is_silent(quiet))
+        self.assertFalse(engine.block_is_silent(loud))
+
+    def test_rejects_unknown_detectors(self):
+        with self.assertRaises(SettingError):
+            coerce_setting("hold_detector", "magic")
+        self.assertEqual(coerce_setting("hold_detector", "voice"), "voice")
+
+
+class LateDetectionTest(unittest.TestCase):
+    """A detector that reports speech 20 ms late (like RNNoise) must not clip words."""
+
+    def late_detector_run(self, pre_roll=True):
+        engine = engine_with_identity_model(hold_context=True)
+        on_time = engine.block_is_quiet
+        late = int(0.020 * RATE)
+        # Judge each block without its last 20 ms, as a lagging detector would.
+        engine.block_is_silent = lambda mono: on_time(mono[:-late])
+        if not pre_roll:
+            original = engine.hold_silence
+
+            def forget_held_block(start_time):
+                result = original(start_time)
+                engine.held_block = None
+                return result
+
+            engine.hold_silence = forget_held_block
+        rng = np.random.default_rng(8)
+        signal = np.zeros(5 * RATE, dtype=np.float32)
+        signal[:RATE] = rng.standard_normal(RATE) * 0.1
+        onset = 4 * RATE - int(0.015 * RATE)  # 15 ms before a block boundary
+        signal[onset:] = rng.standard_normal(signal.shape[0] - onset) * 0.1
+        output, _ = run(engine, signal)
+        return output, signal, onset
+
+    def test_word_start_is_kept_with_pre_roll(self):
+        output, signal, onset = self.late_detector_run()
+        attack = slice(onset + LAG, onset + LAG + int(0.030 * RATE))
+        np.testing.assert_allclose(output[attack], signal[onset : onset + int(0.030 * RATE)], atol=1e-5)
+
+    def test_without_pre_roll_the_word_start_is_lost(self):
+        output, signal, onset = self.late_detector_run(pre_roll=False)
+        attack = output[onset + LAG : onset + LAG + int(0.010 * RATE)]
+        self.assertLess(float(np.abs(attack).max()), 1e-6)
