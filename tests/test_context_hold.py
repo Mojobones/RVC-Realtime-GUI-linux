@@ -85,9 +85,36 @@ class ContextHoldTest(unittest.TestCase):
         # The context is untouched for the whole pause.
         self.assertTrue(torch.equal(snapshots[pause_start], snapshots[resume]))
         speech_blocks = 2 * RATE // engine.block_frame
-        self.assertEqual(len(engine.infer_calls), speech_blocks)
-        # Silence after the 40 ms fade-out of the last word.
-        np.testing.assert_array_equal(output[int(1.04 * RATE) : resume], 0.0)
+        # Plus the first silent block, which is converted normally (hangover).
+        self.assertEqual(len(engine.infer_calls), speech_blocks + 1)
+        np.testing.assert_array_equal(output[RATE + LAG : resume], 0.0)
+
+    def test_word_ending_is_not_faded_out_by_the_hold(self):
+        # Output lags input by 50 ms, so the first silent input block's output
+        # still holds the end of the word; it must come out intact.
+        engine = engine_with_identity_model(hold_context=True)
+        signal = speech_pause_speech()
+
+        output, _ = run(engine, signal)
+
+        np.testing.assert_allclose(
+            output[RATE : RATE + LAG], signal[RATE - LAG : RATE], atol=1e-5
+        )
+
+    def test_a_single_silent_block_between_words_is_not_held(self):
+        engine = engine_with_identity_model(hold_context=True)
+        rng = np.random.default_rng(9)
+        signal = (rng.standard_normal(2 * RATE) * 0.1).astype(np.float32)
+        gap = slice(RATE, RATE + engine.block_frame)  # exactly one silent block
+        signal[gap] = 0.0
+
+        output, _ = run(engine, signal)
+
+        self.assertEqual(len(engine.infer_calls), signal.shape[0] // engine.block_frame)
+        start = RATE // 2
+        np.testing.assert_allclose(
+            output[start:], signal[start - LAG : output.shape[0] - LAG], atol=1e-5
+        )
 
     def test_resume_does_not_replay_the_previous_word(self):
         engine = engine_with_identity_model(hold_context=True)

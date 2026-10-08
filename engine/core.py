@@ -701,6 +701,7 @@ class RealtimeEngine:
             printt("Silence detection: voice detection needs RNNoise at 48 kHz; using loudness")
         self.seam_confidences = []
         self.context_held = False
+        self.previous_block_silent = False
         self.held_block = None
         #: Internal switch for benchmarks; pre-roll is always on in the app.
         self.pre_roll = getattr(self, "pre_roll", True)
@@ -988,7 +989,15 @@ class RealtimeEngine:
         if meter_now - self.last_input_meter_update >= METER_INTERVAL_SECONDS:
             self.latest_input_meter = peak_meter(indata)
             self.last_input_meter_update = meter_now
-        if self.function == "vc" and settings.hold_context and self.block_is_silent(indata):
+        silent = self.function == "vc" and settings.hold_context and self.block_is_silent(indata)
+        # Hold only from the second silent block in a row.  Output lags the
+        # input by the 50 ms fade + search, so the first silent block's output
+        # slot still carries the end of the previous word; holding there would
+        # fade that ending out early (an audible blip).  This also keeps a
+        # single short dip between words from gating the phrase.
+        hold = silent and self.previous_block_silent
+        self.previous_block_silent = silent
+        if hold:
             # Keep the latest held block: if detection was late, the start of
             # the next word is in it (pre-roll, see resume_from_hold).
             self.held_block = indata.copy() if self.pre_roll else None
