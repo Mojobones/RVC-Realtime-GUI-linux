@@ -24,7 +24,8 @@ def discover_models(models_root: str | Path) -> list[ModelEntry]:
 
     entries = []
     for directory in sorted(
-        (path for path in root.iterdir() if path.is_dir()),
+        # Hidden folders are skipped, including in-progress imports (.import-*).
+        (path for path in root.iterdir() if path.is_dir() and not path.name.startswith(".")),
         key=lambda path: path.name.casefold(),
     ):
         model_files = sorted(

@@ -4,7 +4,7 @@ runtime/
 logs/
 recordings/
 configs/config.json
-configs/window.json
+configs/engine.json
 models/*/
 !models/README.md
 
@@ -23,3 +23,6 @@ __pycache__/
 .vscode/
 .idea/
 *.log
+
+# Rust front end build output
+ui/target/

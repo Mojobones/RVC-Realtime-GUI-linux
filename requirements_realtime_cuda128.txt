@@ -14,8 +14,8 @@ soundfile==0.14.0
 transformers==4.49.0
 torchfcpe==0.0.4
 
-# Desktop GUI and audio I/O
-customtkinter==5.2.2
-Pillow
+# Audio I/O
 sounddevice==0.5.5
+
+# Pinned dependency of transformers/huggingface_hub
 PyYAML==6.0.3

@@ -9,15 +9,16 @@
 > warm-up, and input/output noise-reduction fixes in a dedicated desktop client
 > for low-latency RVC voice conversion.
 
-<img width="1760" height="752" alt="RVC-Realtime-GUI screenshot" src="https://github.com/user-attachments/assets/d001d48b-9f00-4eeb-a90c-1474099e8454" />
-
 RVC-Realtime-GUI is a desktop client for low-latency, real-time RVC
 (Retrieval-based Voice Conversion).
 
 > **This fork is a Linux port.** Audio runs through PortAudio on PipeWire:
 > **JACK (via pipewire-jack)** is the low-latency route that replaces ASIO, and
 > PipeWire's ALSA PCMs (`pipewire`, `default`) are the zero-setup fallback.
-> WASAPI, ASIO, and the Windows launchers have been removed.
+> The interface is a native Wayland app built with
+> [libcosmic](https://github.com/pop-os/libcosmic), and it drives a separate
+> Python inference engine. WASAPI, ASIO, the Windows launchers, and the Tk
+> interface have been removed.
 
 This repository contains the source for the **CUDA 12.8 standard build**.
 It is maintained as a focused derivative of
@@ -38,11 +39,14 @@ It is maintained as a focused derivative of
 ### 1. System packages (Arch / CachyOS)
 
 ```sh
-sudo pacman -S --needed portaudio pipewire-jack ffmpeg tk noto-fonts noto-fonts-cjk
+sudo pacman -S --needed portaudio pipewire-jack ffmpeg rustup
+rustup default stable
 ```
 
 On other distributions, install the equivalents: PortAudio built with JACK
-support, PipeWire's JACK replacement, FFmpeg, Tk, and the Noto fonts.
+support, PipeWire's JACK replacement, FFmpeg, and a Rust toolchain (1.93 or
+newer). Building libcosmic also needs the usual Wayland development files
+(`libxkbcommon`, `wayland`).
 
 ### 2. Python environment
 
@@ -71,14 +75,16 @@ assets/
 ### 4. Run
 
 ```sh
-./run.sh
+./run.sh                              # builds the interface on first run
+scripts/install-desktop-entry.sh      # optional: add it to the app launcher
 ```
 
-FFmpeg is found on `PATH` (a binary at `tools/ffmpeg/ffmpeg` is used as a
-fallback).
+The interface starts the engine (`.venv/bin/python -m engine.server`) and
+shows its progress while PyTorch and the audio devices load. The engine stops
+on its own about 10 seconds after the window closes.
 
-> **First launch may take longer than usual** while the inference assets and
-> GPU runtime are initialized.
+FFmpeg is found on `PATH` (a binary at `tools/ffmpeg/ffmpeg` is used as a
+fallback). Set `RVC_UI_LANGUAGE=ja` or `=en` to override the desktop language.
 
 ## Low-latency audio with JACK (PipeWire)
 
@@ -101,42 +107,47 @@ most streaming multiprocessors; you can also pick one in the GPU menu or set
 
 ## Adding models
 
-Create one folder per model inside `models`:
+Drag a model's `.pth` file onto the window, together with its `.index` file
+if it has one. The app copies them into `models/<name>/` (named after the
+`.pth`) and selects the new model. Dropping several `.pth` files adds one model
+each; an `.index` goes with the model whose name it contains.
+
+You can also create the folders yourself, one per model inside `models`:
 
 ```text
 models/
   MyVoice/
     MyVoice.pth
     added_MyVoice.index
-    preview.png
 ```
 
 - The **folder name** is displayed as the model name.
 - Place the model `.pth` and its `added_*.index` file in the same folder.
-- An optional `.png`, `.jpg`, or `.jpeg` image is shown automatically as the
-  model preview.
 - Restart the app or use **Reload** after adding or replacing a model.
 
 ## Highlights
 
-- Dedicated CustomTkinter desktop interface with Japanese and English UI
+- Native COSMIC (libcosmic) interface with Japanese and English UI
 - CUDA 12.8 standard build, including current NVIDIA GPU support
 - Real-time RVC inference with CUDA Graph warm-up
 - JACK (PipeWire) and ALSA audio-device routing with per-channel-pair selection
 - Independent input, output, and monitor device selection
-- Model gallery and model-specific general settings
+- Model-specific voice and level settings
 - WAV recording: separate input/output, mix, or split L/R recording
 - Audio-file input through FFmpeg
 - Runtime-log display and log-file export
+- Scriptable engine: control conversion from the command line with `engine.cli`
 
 ## Source layout
 
 | Path | Purpose |
 | --- | --- |
-| `app/` | Application entry point and GUI |
+| `ui/` | COSMIC interface (Rust, libcosmic) |
+| `engine/` | Headless real-time engine, socket server, and CLI client |
+| `docs/engine-protocol.md` | Protocol between the interface and the engine |
 | `infer/` | RVC real-time inference, HuBERT, RMVPE, and FCPE code |
-| `tools/` | GUI adapter, audio routing, recording, file input, and helpers |
-| `run.sh` | Linux launcher (uses `.venv/`) |
+| `tools/` | Audio routing, recording, file input, and helpers |
+| `run.sh` | Launcher (builds `ui/` on first run) |
 | `configs/config.py` | CUDA device and precision selection |
 | `models/README.md` | Model folder layout used by the packaged application |
 | `tests/` | Source-level regression tests |
@@ -147,18 +158,24 @@ The Git repository intentionally excludes all user-specific and large binary
 files:
 
 - The Python virtual environment (`.venv/`), PyTorch, and CUDA libraries
+- The Rust build output (`ui/target/`)
 - RVC `.pth` models and FAISS `.index` files
 - HuBERT and RMVPE weight files
-- Audio recordings, logs, window position, and local device settings
+- Audio recordings, logs, and local settings (`configs/engine.json`)
 
 The weights come from the Hugging Face release package, not the source history.
 
 ## Development
 
 ```sh
-.venv/bin/python -m pytest tests
-./run.sh
+.venv/bin/python -m pytest tests                 # engine and helpers
+cargo test --manifest-path ui/Cargo.toml         # interface
+.venv/bin/python -m engine.server &              # run the engine on its own…
+.venv/bin/python -m engine.cli watch             # …and inspect its events
 ```
+
+The interface tracks libcosmic's `master` branch; `Cargo.lock` pins the exact
+commit. Update it with `cargo update --manifest-path ui/Cargo.toml -p libcosmic`.
 
 `README_ja.md` still describes the Windows build and has not been updated for
 the Linux port yet.
