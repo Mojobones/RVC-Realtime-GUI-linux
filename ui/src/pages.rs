@@ -523,6 +523,26 @@ pub fn control_bar<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
     .into()
 }
 
+/// Shown over the page while files are dragged onto the window.
+pub fn drop_overlay<'a>() -> Element<'a, Message> {
+    let space = cosmic::theme::spacing();
+    widget::container(
+        widget::container(
+            widget::column::with_capacity(3)
+                .push(widget::icon::from_name("document-open-symbolic").size(48))
+                .push(widget::text::title3(fl!("drop-title")))
+                .push(widget::text::body(fl!("drop-detail")))
+                .spacing(space.space_xs)
+                .align_x(Alignment::Center),
+        )
+        .class(cosmic::theme::Container::Dialog(true))
+        .padding(space.space_l),
+    )
+    .center(Length::Fill)
+    .class(cosmic::theme::Container::Transparent)
+    .into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::mmss;

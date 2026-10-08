@@ -46,6 +46,7 @@ from tools.audio_fifo import AudioFrameFifo, enqueue_latest
 from tools.audio_routing import is_native_api, scatter_mono, select_channels
 from tools.cuda_graph import cuda_graph_enabled, run_cuda_graph
 from tools.file_audio_source import FileAudioSource
+from tools.model_import import ModelImportError, import_models
 from tools.model_registry import discover_models
 from tools.torchgate import TorchGate
 from tools.wav_recorder import WavRecorder
@@ -229,6 +230,22 @@ class RealtimeEngine:
             self.status("settings_changed")
         self.settings.__dict__.update(self.model_settings_for(self.settings.model_name))
         self.emit_state()
+
+    def import_model(self, paths):
+        """Copy dropped .pth/.index files into models/ and select the first."""
+        if not isinstance(paths, list) or not all(isinstance(path, str) for path in paths):
+            raise EngineError("bad_request", "paths must be a list of strings")
+        self.status("importing_model")
+        try:
+            names = import_models(paths, MODELS_ROOT)
+        except ModelImportError as error:
+            raise EngineError(error.code, error.message) from error
+        printt("Imported model(s): %s", ", ".join(names))
+        self.refresh_models()
+        self.update_settings({"model_name": names[0]})
+        self.status("model_imported", names=names)
+        self.emit_state()
+        return names
 
     def reload_devices(self):
         if self.running:

@@ -209,6 +209,7 @@ class EngineServer:
             ),
             "reset_settings": lambda args: engine.reset_settings(require(args, "group", str)),
             "reload_models": lambda args: engine.reload_models(),
+            "import_model": lambda args: {"models": engine.import_model(require(args, "paths", list))},
             "reload_devices": lambda args: engine.reload_devices(),
             "start": lambda args: engine.start(args.get("function", "vc")),
             "stop": lambda args: engine.stop(),

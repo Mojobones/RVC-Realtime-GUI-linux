@@ -107,7 +107,12 @@ most streaming multiprocessors; you can also pick one in the GPU menu or set
 
 ## Adding models
 
-Create one folder per model inside `models`:
+Drag a model's `.pth` file onto the window, together with its `.index` file
+if it has one. The app copies them into `models/<name>/` (named after the
+`.pth`) and selects the new model. Dropping several `.pth` files adds one model
+each; an `.index` goes with the model whose name it contains.
+
+You can also create the folders yourself, one per model inside `models`:
 
 ```text
 models/

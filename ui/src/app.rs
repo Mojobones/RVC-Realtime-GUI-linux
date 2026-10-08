@@ -9,6 +9,7 @@ use cosmic::prelude::*;
 use cosmic::widget::{self, nav_bar, toaster};
 use serde_json::{Value, json};
 
+use crate::drop::DroppedFiles;
 use crate::engine::{self, ErrorInfo, Handle, Meters, Settings, State};
 use crate::fl;
 use crate::pages;
@@ -165,6 +166,7 @@ pub enum Connection {
 #[derive(Clone, Copy, Debug)]
 enum Pending {
     Start,
+    Import,
     RecordStop,
     SaveLog,
 }
@@ -200,6 +202,9 @@ pub enum Message {
     SaveLog,
     ClearLog,
     CloseToast(toaster::ToastId),
+    /// Files are being dragged over the window (true) or left it (false).
+    DragHover(bool),
+    FilesDropped(Option<DroppedFiles>),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -221,6 +226,7 @@ pub struct App {
     dragging: Option<Num>,
     pub seek_preview: Option<f32>,
     pub starting: bool,
+    pub drag_hover: bool,
     pending: HashMap<u64, Pending>,
     /// Request id of the log history fetched after connecting.
     log_request: Option<u64>,
@@ -277,6 +283,7 @@ impl cosmic::Application for App {
             dragging: None,
             seek_preview: None,
             starting: false,
+            drag_hover: false,
             pending: HashMap::new(),
             log_request: None,
             toasts: toaster::Toasts::new(Message::CloseToast),
@@ -452,14 +459,39 @@ impl cosmic::Application for App {
                 self.send("clear_log", json!({}));
             }
             Message::CloseToast(id) => self.toasts.remove(id),
+            Message::DragHover(hovering) => self.drag_hover = hovering,
+            Message::FilesDropped(files) => {
+                self.drag_hover = false;
+                let paths = files.map(|files| files.0).unwrap_or_default();
+                if paths.is_empty() {
+                    return Task::none();
+                }
+                if self.engine.is_none() || self.state.is_none() {
+                    return self.toast(fl!("error-not-ready"));
+                }
+                self.status = fl!("status-importing-model");
+                if let Some(id) = self.send("import_model", json!({"paths": paths})) {
+                    self.pending.insert(id, Pending::Import);
+                }
+            }
         }
         Task::none()
     }
 
     fn view(&self) -> Element<'_, Message> {
         let page = self.nav.active_data::<Page>().copied().unwrap_or(Page::Model);
-        let content = pages::view(self, page);
-        widget::toaster(&self.toasts, content)
+        let mut content = cosmic::iced::widget::Stack::new().push(pages::view(self, page));
+        if self.drag_hover {
+            content = content.push(pages::drop_overlay());
+        }
+        // Dropping .pth files anywhere on the window imports them as models.
+        let drop_target = widget::dnd_destination::dnd_destination_for_data::<DroppedFiles, _>(
+            content,
+            |files, _action| Message::FilesDropped(files),
+        )
+        .on_enter(|_, _, _| Message::DragHover(true))
+        .on_leave(|| Message::DragHover(false));
+        widget::toaster(&self.toasts, drop_target)
     }
 
     fn footer(&self) -> Option<Element<'_, Message>> {
@@ -551,7 +583,10 @@ impl App {
             Event::State(state) => self.apply_state(*state),
             Event::Meters(meters) => self.meters = meters,
             Event::Status { code, data } => {
-                self.status = status_text(&code, &data);
+                let text = status_text(&code, &data);
+                if !text.is_empty() {
+                    self.status = text;
+                }
                 if code == "recording_saved" || code == "stream_stopped" {
                     return self.toast(self.status.clone());
                 }
@@ -588,6 +623,15 @@ impl App {
         match (pending, result) {
             (_, Err(error)) => {
                 let text = error_text(&error);
+                self.status = text.clone();
+                self.toast(text)
+            }
+            (Some(Pending::Import), Ok(value)) => {
+                let names: Vec<&str> = value["models"]
+                    .as_array()
+                    .map(|names| names.iter().filter_map(Value::as_str).collect())
+                    .unwrap_or_default();
+                let text = fl!("model-imported", names = names.join(", "));
                 self.status = text.clone();
                 self.toast(text)
             }
@@ -645,6 +689,9 @@ pub fn status_text(code: &str, data: &Value) -> String {
         "paused" => fl!("status-paused"),
         "playback_stopped" => fl!("status-playback-stopped"),
         "recording_started" => fl!("status-recording-started"),
+        "importing_model" => fl!("status-importing-model"),
+        // The toast from the import response names the model.
+        "model_imported" => String::new(),
         "recording_saved" => {
             let paths: Vec<&str> = data
                 .get("paths")
@@ -670,6 +717,8 @@ pub fn error_text(error: &ErrorInfo) -> String {
         "audio_start_failed" => fl!("error-audio-start-failed", detail = error.message.clone()),
         "monitor_failed" => fl!("error-monitor-failed", detail = error.message.clone()),
         "not_ready" => fl!("error-not-ready"),
+        "import_no_model_file" => fl!("error-import-no-model-file"),
+        "import_failed" => fl!("error-import-failed", detail = error.message.clone()),
         _ => error.message.clone(),
     }
 }

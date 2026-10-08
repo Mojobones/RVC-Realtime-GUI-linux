@@ -1,6 +1,7 @@
 //! COSMIC front end for the RVC real-time engine (`engine/` in the repository).
 
 mod app;
+mod drop;
 mod engine;
 mod i18n;
 mod pages;

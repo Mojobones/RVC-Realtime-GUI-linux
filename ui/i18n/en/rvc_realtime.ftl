@@ -1,5 +1,10 @@
 app-title = RVC Realtime
 
+## Drag and drop
+drop-title = Drop to add models
+drop-detail = Each .pth becomes a model; drop its .index file along with it.
+model-imported = Added model: { $names }
+
 ## Navigation
 page-model = Model
 page-audio = Audio
@@ -16,7 +21,7 @@ engine-retrying = Retrying automatically.
 ## Model page
 section-models = Models
 model = Model
-models-empty = No models found. Add a folder with a .pth file (and optionally an added_*.index file) under models/, then press Reload.
+models-empty = No models yet. Drag a .pth file (and its .index, if you have one) onto this window to add it.
 model-files = Model: { $model } / Index: { $index }
 none = None
 reload = Reload
@@ -117,6 +122,7 @@ status-playing = Playing
 status-paused = Paused
 status-playback-stopped = Playback stopped
 status-recording-started = Recording started
+status-importing-model = Adding model…
 status-recording-saved = Recording saved:
     { $paths }
 
@@ -131,3 +137,5 @@ error-no-common-samplerate = The input, output, and monitor devices have no comm
 error-audio-start-failed = Could not start the audio devices: { $detail }
 error-monitor-failed = The monitor device could not start; continuing on the main output only. ({ $detail })
 error-not-ready = The engine is still starting.
+error-import-no-model-file = Drop an RVC model's .pth file. Its .index file can be dropped along with it.
+error-import-failed = Could not add the model: { $detail }

@@ -1,5 +1,10 @@
 app-title = RVC リアルタイム
 
+## Drag and drop
+drop-title = ドロップしてモデルを追加
+drop-detail = .pth ごとに1つのモデルになります。.index も一緒にドロップしてください。
+model-imported = モデルを追加しました: { $names }
+
 ## Navigation
 page-model = モデル
 page-audio = オーディオ
@@ -16,7 +21,7 @@ engine-retrying = 自動的に再試行します。
 ## Model page
 section-models = モデル
 model = モデル
-models-empty = モデルが見つかりません。models/ に .pth ファイル（必要に応じて added_*.index）を含むフォルダーを追加し、再読み込みを押してください。
+models-empty = モデルがありません。.pth ファイル（.index があれば一緒に）をこのウィンドウにドラッグして追加してください。
 model-files = モデル: { $model } / Index: { $index }
 none = なし
 reload = 再読み込み
@@ -117,6 +122,7 @@ status-playing = 再生中
 status-paused = 一時停止中
 status-playback-stopped = 再生を停止しました
 status-recording-started = 録音を開始しました
+status-importing-model = モデルを追加しています…
 status-recording-saved = 録音を保存しました:
     { $paths }
 
@@ -131,3 +137,5 @@ error-no-common-samplerate = 入力・出力・モニターデバイスに共通
 error-audio-start-failed = 音声デバイスを開始できませんでした: { $detail }
 error-monitor-failed = モニターデバイスを開始できませんでした。通常の出力のみで続行します。（{ $detail }）
 error-not-ready = エンジンを起動しています。
+error-import-no-model-file = RVCモデルの .pth ファイルをドロップしてください。.index も一緒にドロップできます。
+error-import-failed = モデルを追加できませんでした: { $detail }

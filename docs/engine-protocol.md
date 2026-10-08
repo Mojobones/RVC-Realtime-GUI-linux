@@ -49,6 +49,7 @@ translate by `code`.
 | `update_settings` | `{"settings": {key: value, ...}}` | `null` |
 | `reset_settings` | `{"group": "general" \| "performance"}` | `null` |
 | `reload_models` | | `null` |
+| `import_model` | `{"paths": ["/abs/Voice.pth", "/abs/added_Voice.index", …]}` | `{"models": ["Voice"]}`; copies each `.pth` (with matching `.index` files) into `models/<name>/` and selects the first |
 | `reload_devices` | | `null` |
 | `start` | `{"function": "vc" \| "passthrough"}` (default `vc`) | `null` |
 | `stop` | | `null` |
@@ -136,7 +137,7 @@ Front ends can re-render entirely from the latest state.
 | `error` | `{"code", "message"}`: a problem not tied to a request (e.g. `monitor_failed`, `file_error`) |
 | `log` | `{"text": "…"}`: engine stdout/stderr as it is written |
 
-Status codes: `preparing`, `loading_model`, `preparing_inference`,
+Status codes: `importing_model`, `model_imported` (`names`), `preparing`, `loading_model`, `preparing_inference`,
 `starting_audio`, `conversion_started`, `passthrough_started`,
 `conversion_stopped`, `passthrough_stopped`, `settings_changed`,
 `stream_stopped` (the audio device went away), `file_selected` (`name`),
@@ -149,4 +150,4 @@ Status codes: `preparing`, `loading_model`, `preparing_inference`,
 `internal_error`, `bad_setting`, `bad_device`, `gpu_invalid`, `no_model`,
 `model_file_missing`, `index_missing`, `no_audio_file`, `ffmpeg_missing`,
 `no_common_samplerate`, `audio_start_failed`, `record_requires_running`,
-`recording_failed`, `file_error`, `monitor_failed`, `log_save_failed`.
+`recording_failed`, `import_no_model_file`, `import_failed`, `file_error`, `monitor_failed`, `log_save_failed`.
