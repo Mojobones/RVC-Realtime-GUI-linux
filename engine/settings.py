@@ -43,7 +43,6 @@ RESTART_SETTING_KEYS = frozenset(
         "output_device",
         "monitor_device",
         "block_time",
-        "crossfade_time",
         "extra_time",
     )
 )
@@ -59,9 +58,10 @@ class EngineSettings:
     output_device: str = ""
     monitor_device: str | None = None
     block_time: float = 0.25
-    crossfade_time: float = 0.05
     extra_time: float = 2.5
     input_denoise: bool = False
+    #: Freeze the model's past context during silence (see engine/core.py).
+    hold_context: bool = True
     output_denoise: bool = False
     # Keep the original real-time RVC defaults: no envelope post-processing
     # or index blending until the user enables them.
@@ -108,10 +108,10 @@ class EngineSettings:
 SETTING_TYPES = {field.name: field.type for field in fields(EngineSettings)}
 PERFORMANCE_DEFAULT_KEYS = (
     "block_time",
-    "crossfade_time",
     "extra_time",
     "input_denoise",
     "output_denoise",
+    "hold_context",
     "rms_mix_rate",
     "f0method",
 )
@@ -144,7 +144,7 @@ def coerce_setting(key, value):
             raise SettingError(key, f"{key} must be finite")
         if key in ("block_time",):
             value = max(0.02, value)
-        if key in ("crossfade_time", "extra_time", "index_rate"):
+        if key in ("extra_time", "index_rate"):
             value = max(0.0, value)
         if key in ("rms_mix_rate", "index_rate", "file_input_volume"):
             value = min(max(value, 0.0), 1.0)

@@ -23,6 +23,7 @@ engine-unavailable = The engine is not available
 engine-retrying = Retrying automatically.
 
 ## Model page
+assets-missing-banner = Inference assets are missing: { $paths }. Copy the assets/ folder from the CUDA 12.8 release package into the project folder, then restart.
 section-models = Models
 model = Model
 models-empty = No models yet. Drag a .pth file (and its .index, if you have one) onto this window to add it.
@@ -64,7 +65,6 @@ jack-hint = [JACK] devices give the lowest latency. Set the period with PIPEWIRE
 ## Performance page
 section-buffering = Buffering
 chunk = Chunk
-crossfade = Crossfade
 extra = Extra inference buffer
 section-inference = Inference
 pitch-detector = Pitch detector
@@ -74,6 +74,10 @@ f0-pm = PM (fastest)
 volume-envelope = Volume envelope
 gpu = GPU
 gpu-automatic = Automatic (recommended)
+hold-context = Hold context during silence
+hold-context-detail = Keeps the model's memory of your last words while you're quiet, so the first word after a pause isn't slurred.
+input-denoise-rnnoise = Uses RNNoise, a neural noise suppressor (48 kHz streams).
+input-denoise-spectral = Uses spectral gating. Install RNNoise (sudo pacman -S rnnoise) for much better noise removal.
 section-noise = Noise reduction
 input-denoise = Input noise reduction
 output-denoise = Output noise reduction
@@ -143,3 +147,5 @@ error-monitor-failed = The monitor device could not start; continuing on the mai
 error-not-ready = The engine is still starting.
 error-import-no-model-file = Drop an RVC model's .pth file. Its .index file can be dropped along with it.
 error-import-failed = Could not add the model: { $detail }
+error-assets-missing = Can't start: inference assets are missing ({ $paths }). Copy the assets/ folder from the release package into the project folder.
+error-model-load-failed = Could not load the model: { $detail }

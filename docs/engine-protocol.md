@@ -77,9 +77,9 @@ translate by `code`.
 | `input_device` / `output_device` | string | restart; a device `label` from state |
 | `monitor_device` | string \| null | restart; `null` disables the monitor |
 | `block_time` | number (s) | restart; min 0.02 |
-| `crossfade_time` | number (s) | restart |
 | `extra_time` | number (s) | restart |
-| `input_denoise` / `output_denoise` | bool | live |
+| `input_denoise` / `output_denoise` | bool | live; input uses RNNoise at 48 kHz when `librnnoise` is installed, otherwise spectral gating (TorchGate) |
+| `hold_context` | bool | live (default on): while every 10 ms frame of a block is below −50 dBFS (or the noise gate, if higher), conversion emits silence and skips inference, so the model's past context survives the pause |
 | `rms_mix_rate` | number 0–1 | live (volume envelope) |
 | `f0method` | `"pm"` \| `"rmvpe"` \| `"fcpe"` | live |
 | `recording_folder` | string | live |
@@ -90,6 +90,9 @@ translate by `code`.
 | `pitch` | number (semitones) | live, per model |
 | `formant` | number | live, per model |
 | `index_rate` | number 0–1 | live, per model |
+
+Chunks are spliced with WSOLA using a fixed 40 ms crossfade and a 10 ms
+search span (see `tools/splice.py`); there is no crossfade setting.
 
 Per-model settings are saved beside the model (`realtime_settings.json`)
 and replaced with that model's values when `model_name` changes. The others
@@ -117,7 +120,9 @@ Front ends can re-render entirely from the latest state.
   "delay_ms": null,                    // estimated end-to-end delay while running
   "recording": false,
   "file": {"path": null, "duration": null, "playing": false},
-  "ffmpeg": true
+  "ffmpeg": true,
+  "missing_assets": [],               // e.g. ["assets/rmvpe/rmvpe.pt"]
+  "rnnoise": true                     // input noise reduction uses RNNoise (else spectral gating)
 }
 ```
 
@@ -150,4 +155,4 @@ Status codes: `importing_model`, `model_imported` (`names`), `preparing`, `loadi
 `internal_error`, `bad_setting`, `bad_device`, `gpu_invalid`, `no_model`,
 `model_file_missing`, `index_missing`, `no_audio_file`, `ffmpeg_missing`,
 `no_common_samplerate`, `audio_start_failed`, `record_requires_running`,
-`recording_failed`, `import_no_model_file`, `import_failed`, `file_error`, `monitor_failed`, `log_save_failed`.
+`recording_failed`, `assets_missing` (details: `paths`), `model_load_failed`, `import_no_model_file`, `import_failed`, `file_error`, `monitor_failed`, `log_save_failed`.

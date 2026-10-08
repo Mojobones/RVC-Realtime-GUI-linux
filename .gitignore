@@ -9,8 +9,7 @@ models/*/
 !models/README.md
 
 # Inference assets and bundled binaries are distributed separately.
-assets/hubert_base/pytorch_model.bin
-assets/rmvpe/rmvpe.pt
+assets/
 tools/ffmpeg/
 
 # Python-generated files

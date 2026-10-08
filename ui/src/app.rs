@@ -57,7 +57,6 @@ pub enum Num {
     IndexRate,
     RmsMix,
     BlockTime,
-    Crossfade,
     Extra,
     FileVolume,
 }
@@ -74,7 +73,6 @@ impl Num {
             Num::IndexRate => "index_rate",
             Num::RmsMix => "rms_mix_rate",
             Num::BlockTime => "block_time",
-            Num::Crossfade => "crossfade_time",
             Num::Extra => "extra_time",
             Num::FileVolume => "file_input_volume",
         }
@@ -90,7 +88,6 @@ impl Num {
             Num::Formant => (-5.0, 5.0, 0.01),
             Num::IndexRate | Num::RmsMix => (0.0, 1.0, 0.01),
             Num::BlockTime => (0.02, 1.5, 0.01),
-            Num::Crossfade => (0.01, 0.15, 0.01),
             Num::Extra => (0.05, 5.0, 0.01),
             Num::FileVolume => (0.0, 1.0, 0.01),
         }
@@ -131,7 +128,7 @@ impl Num {
 
     /// Changing these stops a running stream, so they are sent on release.
     pub fn needs_restart(self) -> bool {
-        matches!(self, Num::BlockTime | Num::Crossfade | Num::Extra)
+        matches!(self, Num::BlockTime | Num::Extra)
     }
 
     pub fn get(self, settings: &Settings) -> f32 {
@@ -145,7 +142,6 @@ impl Num {
             Num::IndexRate => settings.index_rate,
             Num::RmsMix => settings.rms_mix_rate,
             Num::BlockTime => settings.block_time,
-            Num::Crossfade => settings.crossfade_time,
             Num::Extra => settings.extra_time,
             Num::FileVolume => settings.file_input_volume,
         }
@@ -162,7 +158,6 @@ impl Num {
             Num::IndexRate => &mut settings.index_rate,
             Num::RmsMix => &mut settings.rms_mix_rate,
             Num::BlockTime => &mut settings.block_time,
-            Num::Crossfade => &mut settings.crossfade_time,
             Num::Extra => &mut settings.extra_time,
             Num::FileVolume => &mut settings.file_input_volume,
         };
@@ -174,6 +169,7 @@ impl Num {
 pub enum Toggle {
     InputDenoise,
     OutputDenoise,
+    HoldContext,
 }
 
 impl Toggle {
@@ -181,6 +177,7 @@ impl Toggle {
         match self {
             Toggle::InputDenoise => "input_denoise",
             Toggle::OutputDenoise => "output_denoise",
+            Toggle::HoldContext => "hold_context",
         }
     }
 }
@@ -828,6 +825,14 @@ pub fn error_text(error: &ErrorInfo) -> String {
         "not_ready" => fl!("error-not-ready"),
         "import_no_model_file" => fl!("error-import-no-model-file"),
         "import_failed" => fl!("error-import-failed", detail = error.message.clone()),
+        "assets_missing" => {
+            let paths: Vec<&str> = error.details["paths"]
+                .as_array()
+                .map(|paths| paths.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            fl!("error-assets-missing", paths = paths.join(", "))
+        }
+        "model_load_failed" => fl!("error-model-load-failed", detail = error.message.clone()),
         _ => error.message.clone(),
     }
 }

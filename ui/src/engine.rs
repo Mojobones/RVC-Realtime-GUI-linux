@@ -36,6 +36,12 @@ pub struct State {
     pub recording: bool,
     pub file: FileState,
     pub ffmpeg: bool,
+    /// Asset files the engine needs but cannot find (see README).
+    #[serde(default)]
+    pub missing_assets: Vec<String>,
+    /// Whether input noise reduction can use RNNoise (otherwise spectral gating).
+    #[serde(default)]
+    pub rnnoise: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -47,10 +53,10 @@ pub struct Settings {
     pub output_device: String,
     pub monitor_device: Option<String>,
     pub block_time: f32,
-    pub crossfade_time: f32,
     pub extra_time: f32,
     pub input_denoise: bool,
     pub output_denoise: bool,
+    pub hold_context: bool,
     pub rms_mix_rate: f32,
     pub f0method: String,
     pub recording_folder: String,
@@ -110,6 +116,8 @@ pub struct Meters {
 pub struct ErrorInfo {
     pub code: String,
     pub message: String,
+    #[serde(default)]
+    pub details: Value,
 }
 
 #[derive(Clone, Debug)]

@@ -8,6 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchaudio.transforms import Resample
 
+from engine.assets import RMVPE_PATH
 from infer.hubert import extract_hubert_features, load_hubert_model
 from tools.cuda_graph import run_cuda_graph
 
@@ -17,6 +18,29 @@ def printt(strr, *args):
         print(strr)
     else:
         print(strr % args)
+
+
+#: RMVPE pitch context (seconds).  tools/pitch_bench.py on real speech: the
+#: old block + 50 ms window (0.32 s at 0.25 s blocks) had 2.7% gross pitch
+#: errors and octave jumps; 1.28 s cut gross errors by 60%, removed octave
+#: errors and halved voicing mistakes for about 1 ms per block.  Returns
+#: flatten beyond that.
+RMVPE_CONTEXT_SECONDS = 1.28
+#: RMVPE windows are whole multiples of 32 mel frames (5120 samples) minus a hop.
+RMVPE_WINDOW_STEP = 5120
+
+
+def rmvpe_window(block_frame_16k, available):
+    """Samples of 16 kHz context to give RMVPE, at least the newest block.
+
+    The window must end at the newest sample and fit in the ``available``
+    context; it is rounded to RMVPE's frame structure.
+    """
+    wanted = max(block_frame_16k + 800, int(RMVPE_CONTEXT_SECONDS * 16000))
+    window = RMVPE_WINDOW_STEP * ((wanted - 1) // RMVPE_WINDOW_STEP + 1) - 160
+    largest = RMVPE_WINDOW_STEP * ((available + 160) // RMVPE_WINDOW_STEP) - 160
+    minimum = RMVPE_WINDOW_STEP * ((block_frame_16k + 800 - 1) // RMVPE_WINDOW_STEP + 1) - 160
+    return max(min(window, largest), min(minimum, available))
 
 
 def get_synthesizer(pth_path, device=torch.device("cpu")):
@@ -125,8 +149,11 @@ class RVC:
                 self.model_rmvpe = last_rvc.model_rmvpe
             if last_rvc is not None and hasattr(last_rvc, "model_fcpe"):
                 self.model_fcpe = last_rvc.model_fcpe
-        except:
+        except Exception:
+            # Re-raise: a half-initialised RVC (e.g. missing tgt_sr) only
+            # produces a confusing error later on.
             printt(traceback.format_exc())
+            raise
 
     def change_key(self, new_key):
         self.f0_up_key = new_key
@@ -189,7 +216,7 @@ class RVC:
 
             printt("Loading RMVPE model")
             self.model_rmvpe = RMVPE(
-                "assets/rmvpe/rmvpe.pt",
+                RMVPE_PATH,
                 is_half=self.is_half,
                 device=self.device,
             )
@@ -288,7 +315,8 @@ class RVC:
         if self.if_f0 == 1:
             f0_extractor_frame = block_frame_16k + 800
             if f0method == "rmvpe":
-                f0_extractor_frame = 5120 * ((f0_extractor_frame - 1) // 5120 + 1) - 160
+                # RMVPE gains a lot from past context; FCPE and PM do not use it.
+                f0_extractor_frame = rmvpe_window(block_frame_16k, input_wav.shape[0])
             pitch, pitchf = self.get_f0(
                 input_wav[-f0_extractor_frame:],
                 self.f0_up_key - self.formant_shift,

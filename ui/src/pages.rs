@@ -177,7 +177,18 @@ fn model_page<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
         })
         .unwrap_or_default();
 
-    page_column(vec![
+    let mut sections = Vec::with_capacity(5);
+    if !state.missing_assets.is_empty() {
+        sections.push(
+            widget::warning(fl!(
+                "assets-missing-banner",
+                paths = state.missing_assets.join(", ")
+            ))
+            .into_widget()
+            .into(),
+        );
+    }
+    sections.extend([
         settings::section()
             .title(fl!("section-models"))
             .add(if state.models.is_empty() {
@@ -257,7 +268,8 @@ fn model_page<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
             ))
             .into(),
         reset_row(fl!("reset-model-settings"), "general"),
-    ])
+    ]);
+    page_column(sections)
 }
 
 fn reset_row<'a>(label: String, group: &'static str) -> Element<'a, Message> {
@@ -420,13 +432,6 @@ fn performance_page<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> 
                 state,
                 seconds,
             ))
-            .add(slider_item(
-                app,
-                fl!("crossfade"),
-                Num::Crossfade,
-                state,
-                seconds,
-            ))
             .add(slider_item(app, fl!("extra"), Num::Extra, state, seconds))
             .into(),
         settings::section()
@@ -450,14 +455,27 @@ fn performance_page<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> 
                 gpu_index,
                 Message::SelectGpu,
             ))
+            .add(
+                settings::item::builder(fl!("hold-context"))
+                    .description(fl!("hold-context-detail"))
+                    .toggler(settings_.hold_context, |value| {
+                        Message::Toggle(Toggle::HoldContext, value)
+                    }),
+            )
             .into(),
         settings::section()
             .title(fl!("section-noise"))
-            .add(settings::item(
-                fl!("input-denoise"),
-                widget::toggler(settings_.input_denoise)
-                    .on_toggle(|value| Message::Toggle(Toggle::InputDenoise, value)),
-            ))
+            .add(
+                settings::item::builder(fl!("input-denoise"))
+                    .description(if state.rnnoise {
+                        fl!("input-denoise-rnnoise")
+                    } else {
+                        fl!("input-denoise-spectral")
+                    })
+                    .toggler(settings_.input_denoise, |value| {
+                        Message::Toggle(Toggle::InputDenoise, value)
+                    }),
+            )
             .add(settings::item(
                 fl!("output-denoise"),
                 widget::toggler(settings_.output_denoise)

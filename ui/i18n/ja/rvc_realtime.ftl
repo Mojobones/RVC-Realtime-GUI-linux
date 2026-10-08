@@ -23,6 +23,7 @@ engine-unavailable = エンジンを利用できません
 engine-retrying = 自動的に再試行します。
 
 ## Model page
+assets-missing-banner = 推論用アセットが見つかりません: { $paths }。CUDA 12.8 リリースパッケージの assets/ フォルダーをプロジェクトフォルダーにコピーしてから再起動してください。
 section-models = モデル
 model = モデル
 models-empty = モデルがありません。.pth ファイル（.index があれば一緒に）をこのウィンドウにドラッグして追加してください。
@@ -64,7 +65,6 @@ jack-hint = [JACK] デバイスが最も低遅延です。周期は PIPEWIRE_QUA
 ## Performance page
 section-buffering = バッファー
 chunk = チャンク長
-crossfade = クロスフェード
 extra = 追加推論バッファ
 section-inference = 推論
 pitch-detector = ピッチ検出方式
@@ -74,6 +74,10 @@ f0-pm = PM（最速）
 volume-envelope = 音量追従ミックス
 gpu = 使用GPU
 gpu-automatic = 自動（推奨）
+hold-context = 無音中はコンテキストを保持
+hold-context-detail = 黙っている間も直前の発話をモデルの文脈として保持し、間の後の最初の言葉が不明瞭になるのを防ぎます。
+input-denoise-rnnoise = ニューラルノイズ抑制 RNNoise を使用します（48 kHz）。
+input-denoise-spectral = スペクトルゲートを使用しています。RNNoise（sudo pacman -S rnnoise）を導入するとノイズ除去が大幅に向上します。
 section-noise = ノイズ低減
 input-denoise = 入力ノイズの低減
 output-denoise = 出力ノイズの低減
@@ -143,3 +147,5 @@ error-monitor-failed = モニターデバイスを開始できませんでした
 error-not-ready = エンジンを起動しています。
 error-import-no-model-file = RVCモデルの .pth ファイルをドロップしてください。.index も一緒にドロップできます。
 error-import-failed = モデルを追加できませんでした: { $detail }
+error-assets-missing = 開始できません: 推論用アセットがありません（{ $paths }）。リリースパッケージの assets/ フォルダーをプロジェクトフォルダーにコピーしてください。
+error-model-load-failed = モデルを読み込めませんでした: { $detail }

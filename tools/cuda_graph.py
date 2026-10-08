@@ -13,6 +13,8 @@ ENV_NAME = "RVC_CUDA_GRAPH"
 MAX_CACHE_ENV = "RVC_CUDA_GRAPH_MAX_CACHE"
 _probe_lock = threading.Lock()
 _probe_result = None
+_capture_streams = {}
+_capture_streams_lock = threading.Lock()
 
 
 def _device_type(device):
@@ -26,6 +28,22 @@ def _cuda_device(device):
     if parsed.index is None:
         parsed = torch.device("cuda", torch.cuda.current_device())
     return parsed
+
+
+def _capture_stream(device):
+    """A capture stream on ``device``.
+
+    torch.cuda.graph() otherwise uses one process-wide stream created on
+    whichever GPU was current at first use (the startup probe's).  Capturing
+    another GPU's work on it records nothing or fails, and a failed capture
+    poisons every later one.
+    """
+    with _capture_streams_lock:
+        stream = _capture_streams.get(device)
+        if stream is None:
+            stream = torch.cuda.Stream(device=device)
+            _capture_streams[device] = stream
+        return stream
 
 
 def _clone_output(value):
@@ -58,7 +76,7 @@ def detect_cuda_graph_support(device):
             current.wait_stream(warmup)
             torch.cuda.synchronize(cuda_device)
             graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
+            with torch.cuda.graph(graph, stream=_capture_stream(cuda_device)):
                 captured = probe.square() + 1
             probe.copy_(torch.arange(32, device=cuda_device, dtype=torch.float32))
             graph.replay()
@@ -115,24 +133,26 @@ class _CapturedCall:
         for static, value in zip(self.inputs, inputs):
             static.copy_(value)
         device = self.inputs[0].device
-        current = torch.cuda.current_stream(device)
-        warmup = torch.cuda.Stream(device=device)
-        warmup.wait_stream(current)
-        with torch.cuda.stream(warmup), torch.no_grad():
-            for _ in range(3):
-                output = function(*self.inputs)
-        current.wait_stream(warmup)
-        torch.cuda.synchronize(device)
-        self.graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(self.graph), torch.no_grad():
-            self.output = function(*self.inputs)
+        with torch.cuda.device(device):
+            current = torch.cuda.current_stream(device)
+            warmup = torch.cuda.Stream(device=device)
+            warmup.wait_stream(current)
+            with torch.cuda.stream(warmup), torch.no_grad():
+                for _ in range(3):
+                    output = function(*self.inputs)
+            current.wait_stream(warmup)
+            torch.cuda.synchronize(device)
+            self.graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(self.graph, stream=_capture_stream(device)), torch.no_grad():
+                self.output = function(*self.inputs)
         self.capture_ms = (time.perf_counter() - started) * 1000.0
         self.done_event = None
         del output
 
     def replay(self, inputs):
-        with self.lock:
-            stream = torch.cuda.current_stream(self.inputs[0].device)
+        device = self.inputs[0].device
+        with self.lock, torch.cuda.device(device):
+            stream = torch.cuda.current_stream(device)
             if self.done_event is not None:
                 stream.wait_event(self.done_event)
             for static, value in zip(self.inputs, inputs):

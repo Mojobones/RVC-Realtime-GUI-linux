@@ -71,6 +71,18 @@ class PersistenceTest(unittest.TestCase):
         self.assertEqual(loaded.f0method, "rmvpe")
         self.assertEqual(loaded.extra_time, 1.0)
 
+    def test_old_crossfade_setting_is_ignored(self):
+        # Crossfade is now a fixed 40 ms WSOLA fade (tools/splice.py).
+        with open(self.path, "w", encoding="utf-8") as config_file:
+            json.dump({"crossfade_time": 0.15, "block_time": 0.3}, config_file)
+
+        loaded = load_settings(self.path)
+
+        self.assertEqual(loaded.block_time, 0.3)
+        self.assertFalse(hasattr(loaded, "crossfade_time"))
+        with self.assertRaises(SettingError):
+            coerce_setting("crossfade_time", 0.04)
+
     def test_missing_or_corrupt_file_gives_defaults(self):
         self.assertEqual(load_settings(self.path), EngineSettings())
         with open(self.path, "w", encoding="utf-8") as config_file:

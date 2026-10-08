@@ -43,7 +43,6 @@ class SettingsDefaultsTest(unittest.TestCase):
     def test_performance_defaults_are_valid(self):
         settings = EngineSettings()
         self.assertGreater(settings.block_time, 0)
-        self.assertGreater(settings.crossfade_time, 0)
         self.assertGreater(settings.extra_time, 0)
 
 

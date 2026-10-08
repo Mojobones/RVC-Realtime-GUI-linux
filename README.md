@@ -39,12 +39,13 @@ It is maintained as a focused derivative of
 ### 1. System packages (Arch / CachyOS)
 
 ```sh
-sudo pacman -S --needed portaudio pipewire-jack ffmpeg rustup
+sudo pacman -S --needed portaudio pipewire-jack ffmpeg rnnoise rustup
 rustup default stable
 ```
 
 On other distributions, install the equivalents: PortAudio built with JACK
-support, PipeWire's JACK replacement, FFmpeg, and a Rust toolchain (1.93 or
+support, PipeWire's JACK replacement, FFmpeg, RNNoise (used for input noise
+reduction; spectral gating is the fallback), and a Rust toolchain (1.93 or
 newer). Building libcosmic also needs the usual Wayland development files
 (`libxkbcommon`, `wayland`).
 
@@ -172,6 +173,24 @@ The weights come from the Hugging Face release package, not the source history.
 cargo test --manifest-path ui/Cargo.toml         # interface
 .venv/bin/python -m engine.server &              # run the engine on its own…
 .venv/bin/python -m engine.cli watch             # …and inspect its events
+```
+
+**Context hold** (Performance → *Hold context during silence*, on by
+default) stops silence from pushing your last words out of the model's
+context, so the first word after a pause isn't slurred. To measure it on your
+own model and voice:
+
+```sh
+.venv/bin/python -m tools.context_bench --model "My Voice" --input speech.wav
+```
+
+Chunks are spliced with WSOLA and a fixed 40 ms crossfade
+(`tools/splice.py`). To compare it with the previous SOLA splice on your own
+model, record real inference chunks once, then replay them through both:
+
+```sh
+.venv/bin/python -m tools.splice_bench record --model "My Voice" --input speech.wav
+.venv/bin/python -m tools.splice_bench compare   # writes logs/splice_bench/{sola,wsola}.wav
 ```
 
 The interface tracks libcosmic's `master` branch; `Cargo.lock` pins the exact

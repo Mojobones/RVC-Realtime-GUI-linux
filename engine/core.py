@@ -13,7 +13,6 @@ JACK worker, and the file decoder only touch the audio buffers and the
 import os
 import queue
 import shutil
-import sys
 import threading
 import time
 import traceback
@@ -26,6 +25,7 @@ import torch.nn.functional as F
 import torchaudio.transforms as tat
 
 from configs.config import Config, get_device_dtype_sm, infer_device
+from engine.assets import missing_assets
 from engine.devices import DeviceCatalog
 from engine.settings import (
     DEFAULT_RECORDING_FOLDER,
@@ -47,13 +47,30 @@ from tools.audio_routing import is_native_api, scatter_mono, select_channels
 from tools.cuda_graph import cuda_graph_enabled, run_cuda_graph
 from tools.file_audio_source import FileAudioSource
 from tools.model_import import ModelImportError, import_models
+from tools import rnnoise
 from tools.model_registry import discover_models
+from tools.splice import (
+    CONFIDENCE_THRESHOLD,
+    FADE_SECONDS,
+    SEARCH_SECONDS,
+    WsolaSplicer,
+)
 from tools.torchgate import TorchGate
 from tools.wav_recorder import WavRecorder
 
 MODELS_ROOT = os.path.join(PROJECT_ROOT, "models")
 MODEL_SETTINGS_SAVE_DELAY_SECONDS = 0.25
 METER_INTERVAL_SECONDS = 0.1
+#: How often running seam-confidence statistics are logged.
+SEAM_LOG_SECONDS = 5.0
+#: A block counts as silence for context hold when every 10 ms frame is
+#: below this level (or below the noise gate, whichever is higher).
+HOLD_THRESHOLD_DB = -50.0
+#: RNNoise's own output delay: one 10 ms frame of buffering plus its 10 ms
+#: window overlap (960 samples, measured on real speech; tests/test_rnnoise.py).
+RNNOISE_DELAY_SECONDS = 0.020
+#: Fade-in after the stale output that follows a held pause.
+RESUME_RAMP_SECONDS = 0.005
 FUNCTIONS = {"vc": "vc", "passthrough": "im"}
 
 
@@ -119,6 +136,9 @@ class RealtimeEngine:
         self.latest_monitor_meter = 0.0
         self.latest_infer_time = 0
         self.recorder = WavRecorder()
+        #: Optional callable receiving each raw inference chunk (benchmarks).
+        self.chunk_tap = None
+        self.seam_confidences = []
         self.file_audio_source = None
         self.file_input_path = ""
         self.file_state = (False, False)
@@ -165,6 +185,8 @@ class RealtimeEngine:
                 "playing": bool(source and source.playing),
             },
             "ffmpeg": os.path.isfile(self.ffmpeg_path),
+            "rnnoise": rnnoise.available(),
+            "missing_assets": missing_assets(),
         }
 
     def emit_state(self):
@@ -286,6 +308,10 @@ class RealtimeEngine:
         }
         if not changed:
             return
+        if self.running and "f0method" in changed:
+            # The detector loads on first use inside the audio thread, where
+            # a missing file would stop the stream.
+            self.require_assets(changed["f0method"])
         if "model_name" in changed:
             self.flush_model_settings_save(force=True)
         for key, value in changed.items():
@@ -313,9 +339,7 @@ class RealtimeEngine:
         if "index_rate" in changed:
             self.rvc.change_index_rate(self.settings.index_rate)
         if "input_denoise" in changed and self.running:
-            self.delay_time += (1 if self.settings.input_denoise else -1) * min(
-                self.settings.crossfade_time, 0.04
-            )
+            self.delay_time += (1 if self.settings.input_denoise else -1) * self.input_denoise_delay()
 
     def reset_settings(self, group):
         defaults = EngineSettings()
@@ -358,6 +382,8 @@ class RealtimeEngine:
         printt("=== Startup diagnostics ===")
         printt("FFmpeg: %s (found=%s)", self.ffmpeg_path, os.path.isfile(self.ffmpeg_path))
         printt("Models discovered: %s", len(self.models))
+        missing = missing_assets()
+        printt("Inference assets: %s", "missing " + ", ".join(missing) if missing else "ok")
         printt("CUDA available: %s", torch.cuda.is_available())
         if torch.cuda.is_available():
             printt("CUDA devices: %s", torch.cuda.device_count())
@@ -481,14 +507,13 @@ class RealtimeEngine:
             stream_latency = self.stream.latency
             if isinstance(stream_latency, (tuple, list)):
                 stream_latency = stream_latency[-1]
+            # Each emitted block lags the input by the fade plus the WSOLA
+            # search span, minus the (usually small) splice offset.
             self.delay_time = (
-                stream_latency
-                + self.settings.block_time
-                + self.settings.crossfade_time
-                + 0.01
+                stream_latency + self.settings.block_time + FADE_SECONDS + SEARCH_SECONDS
             )
         if self.settings.input_denoise:
-            self.delay_time += min(self.settings.crossfade_time, 0.04)
+            self.delay_time += self.input_denoise_delay()
         save_settings(self.settings)
         self.status(
             "passthrough_started" if self.function == "im" else "conversion_started"
@@ -505,6 +530,7 @@ class RealtimeEngine:
                 f"Model file not found: {model.model_path}",
                 path=str(model.model_path),
             )
+        self.require_assets(self.settings.f0method)
         if self.settings.index_rate > 0 and model.index_path is None:
             raise EngineError(
                 "index_missing",
@@ -519,6 +545,17 @@ class RealtimeEngine:
                 raise EngineError("ffmpeg_missing", "FFmpeg was not found.")
         self.set_devices()
         return model
+
+    @staticmethod
+    def require_assets(f0method):
+        missing = missing_assets(f0method)
+        if missing:
+            raise EngineError(
+                "assets_missing",
+                "Inference assets are missing: " + ", ".join(missing)
+                + ". Copy the assets/ folder from the release package into the project.",
+                paths=missing,
+            )
 
     def set_devices(self):
         settings = self.settings
@@ -567,41 +604,52 @@ class RealtimeEngine:
         )
 
     def start_vc(self, model):
-        self.status("loading_model")
-        torch.cuda.empty_cache()
-        self.rvc = rvc_for_realtime.RVC(
-            self.settings.pitch,
-            self.settings.formant,
-            str(model.model_path),
-            str(model.index_path) if model.index_path is not None else "",
-            self.settings.index_rate,
-            self.config,
-            self.rvc if hasattr(self, "rvc") else None,
-        )
+        self.load_model(model)
         # Decoded files are always supplied as mono float32 blocks.  Do not
         # inherit a JACK input endpoint's channel layout for file input.
         self.input_channels = 1 if self.file_source_active else self.get_device_channels()
         self.output_channels = self.get_output_channels()
-        self.samplerate = self.get_automatic_samplerate(self.rvc.tgt_sr)
+        self.prepare_inference(self.get_automatic_samplerate(self.rvc.tgt_sr))
+        self.status("starting_audio")
+        if self.output_stream is not None:
+            self.stop()
+        self.start_stream()
+
+    def load_model(self, model):
+        self.status("loading_model")
+        torch.cuda.empty_cache()
+        try:
+            self.rvc = rvc_for_realtime.RVC(
+                self.settings.pitch,
+                self.settings.formant,
+                str(model.model_path),
+                str(model.index_path) if model.index_path is not None else "",
+                self.settings.index_rate,
+                self.config,
+                self.rvc if hasattr(self, "rvc") else None,
+            )
+        except Exception as error:
+            raise EngineError(
+                "model_load_failed",
+                f"Could not load {model.model_path.name}: {error}",
+                model=model.name,
+            ) from error
+
+    def prepare_inference(self, samplerate):
+        """Allocate the inference buffers for ``samplerate``; no audio devices."""
+        self.samplerate = samplerate
         self.zc = self.samplerate // 100
         self.block_frame = (
             int(np.round(self.settings.block_time * self.samplerate / self.zc)) * self.zc
         )
         self.block_frame_16k = 160 * self.block_frame // self.zc
-        self.crossfade_frame = (
-            int(np.round(self.settings.crossfade_time * self.samplerate / self.zc))
-            * self.zc
-        )
-        self.sola_buffer_frame = min(self.crossfade_frame, 4 * self.zc)
-        self.sola_search_frame = self.zc
+        self.splicer = WsolaSplicer(self.samplerate, self.block_frame, self.config.device)
+        self.fade_frame = self.splicer.fade
         self.extra_frame = (
             int(np.round(self.settings.extra_time * self.samplerate / self.zc)) * self.zc
         )
         self.input_wav = torch.zeros(
-            self.extra_frame
-            + self.crossfade_frame
-            + self.sola_search_frame
-            + self.block_frame,
+            self.extra_frame + self.splicer.input_length,
             device=self.config.device,
             dtype=torch.float32,
         )
@@ -612,33 +660,12 @@ class RealtimeEngine:
             dtype=torch.float32,
         )
         self.rms_buffer = np.zeros(4 * self.zc, dtype="float32")
-        self.sola_buffer = torch.zeros(
-            self.sola_buffer_frame, device=self.config.device, dtype=torch.float32
+        self.nr_buffer = torch.zeros(
+            self.fade_frame, device=self.config.device, dtype=torch.float32
         )
-        self.sola_den_kernel = torch.ones(
-            1, 1, self.sola_buffer_frame, device=self.config.device, dtype=torch.float32
-        )
-        self.nr_buffer = self.sola_buffer.clone()
         self.output_buffer = self.input_wav.clone()
         self.skip_head = self.extra_frame // self.zc
-        self.return_length = (
-            self.block_frame + self.sola_buffer_frame + self.sola_search_frame
-        ) // self.zc
-        self.fade_in_window = (
-            torch.sin(
-                0.5
-                * np.pi
-                * torch.linspace(
-                    0.0,
-                    1.0,
-                    steps=self.sola_buffer_frame,
-                    device=self.config.device,
-                    dtype=torch.float32,
-                )
-            )
-            ** 2
-        )
-        self.fade_out_window = 1 - self.fade_in_window
+        self.return_length = self.splicer.input_length // self.zc
         self.resampler = tat.Resample(
             orig_freq=self.samplerate, new_freq=16000, dtype=torch.float32
         ).to(self.config.device)
@@ -651,12 +678,27 @@ class RealtimeEngine:
         self.tg = TorchGate(
             sr=self.samplerate, n_fft=4 * self.zc, prop_decrease=0.9
         ).to(self.config.device)
+        # Input noise reduction: RNNoise when the library is installed and the
+        # stream runs at its 48 kHz rate; TorchGate spectral gating otherwise.
+        self.rnnoise = None
+        if rnnoise.available() and self.samplerate == rnnoise.SAMPLE_RATE:
+            self.rnnoise = rnnoise.RNNoise()
+        printt(
+            "Input noise reduction: %s",
+            "RNNoise"
+            if self.rnnoise
+            else "spectral gate (RNNoise %s)"
+            % ("needs 48 kHz" if rnnoise.available() else "not installed"),
+        )
+        self.seam_confidences = []
+        self.context_held = False
+        self.stale_samples = 0
+        ramp = max(1, int(RESUME_RAMP_SECONDS * self.samplerate))
+        self.resume_ramp = torch.linspace(
+            0.0, 1.0, steps=ramp, device=self.config.device, dtype=torch.float32
+        )
         self.status("preparing_inference")
         self.prewarm_cuda_graph()
-        self.status("starting_audio")
-        if self.output_stream is not None:
-            self.stop()
-        self.start_stream()
 
     def prewarm_cuda_graph(self):
         if not cuda_graph_enabled(self.config.device):
@@ -668,7 +710,7 @@ class RealtimeEngine:
             self.input_wav_res.copy_(probe)
 
             if self.settings.input_denoise:
-                short = self.input_wav[-self.sola_buffer_frame - self.block_frame :].unsqueeze(0)
+                short = self.input_wav[-self.fade_frame - self.block_frame :].unsqueeze(0)
                 self.tg(short, self.input_wav.unsqueeze(0))
 
             resample_input = self.input_wav[-self.block_frame - 2 * self.zc :]
@@ -703,7 +745,7 @@ class RealtimeEngine:
             self.input_wav_denoise.zero_()
             self.input_wav_res.zero_()
             self.output_buffer.zero_()
-            self.sola_buffer.zero_()
+            self.splicer.reset()
             self.nr_buffer.zero_()
             self.rvc.cache_pitch.zero_()
             self.rvc.cache_pitchf.zero_()
@@ -934,6 +976,14 @@ class RealtimeEngine:
         if meter_now - self.last_input_meter_update >= METER_INTERVAL_SECONDS:
             self.latest_input_meter = peak_meter(indata)
             self.last_input_meter_update = meter_now
+        if self.function == "vc" and settings.hold_context and self.block_is_silent(indata):
+            return self.hold_silence(start_time)
+        if self.context_held:
+            # Resuming after a held pause: the head of this chunk's output
+            # window still holds the frozen context (the end of the previous
+            # word), which must not be replayed.
+            self.context_held = False
+            self.stale_samples = self.splicer.input_length - self.block_frame
         if settings.noise_gate_db > -60:
             indata = np.append(self.rms_buffer, indata)
             rms = librosa.feature.rms(
@@ -958,12 +1008,26 @@ class RealtimeEngine:
             self.input_wav_denoise[: -self.block_frame] = self.input_wav_denoise[
                 self.block_frame :
             ].clone()
-            input_wav = self.input_wav[-self.sola_buffer_frame - self.block_frame :]
+        if settings.input_denoise and self.rnnoise is not None:
+            # RNNoise keeps a recurrent state, so it sees each block once, in order.
+            denoised = self.rnnoise.process(indata)
+            self.input_wav_denoise[-self.block_frame :] = torch.from_numpy(denoised).to(
+                self.config.device
+            )
+            resample_input = self.input_wav_denoise[-self.block_frame - 2 * self.zc :]
+            self.input_wav_res[-self.block_frame_16k - 160 :] = run_cuda_graph(
+                self.resampler,
+                "realtime-input-resample",
+                lambda audio: self.resampler(audio),
+                resample_input,
+            )[160:]
+        elif settings.input_denoise:
+            input_wav = self.input_wav[-self.fade_frame - self.block_frame :]
             input_wav = self.tg(
                 input_wav.unsqueeze(0), self.input_wav.unsqueeze(0)
             ).squeeze(0)
-            input_wav[: self.sola_buffer_frame] *= self.fade_in_window
-            input_wav[: self.sola_buffer_frame] += self.nr_buffer * self.fade_out_window
+            input_wav[: self.fade_frame] *= self.splicer.fade_in
+            input_wav[: self.fade_frame] += self.nr_buffer * self.splicer.fade_out
             self.input_wav_denoise[-self.block_frame :] = input_wav[: self.block_frame]
             self.nr_buffer[:] = input_wav[self.block_frame :]
             resample_input = self.input_wav_denoise[-self.block_frame - 2 * self.zc :]
@@ -1042,24 +1106,59 @@ class RealtimeEngine:
             )[0, 0, :-1]
             rms2 = torch.max(rms2, torch.zeros_like(rms2) + 1e-3)
             infer_wav *= torch.pow(rms1 / rms2, 1.0 - settings.rms_mix_rate)
-        # SOLA algorithm from https://github.com/yxlllc/DDSP-SVC
-        conv_input = infer_wav[None, None, : self.sola_buffer_frame + self.sola_search_frame]
-        cor_nom = F.conv1d(conv_input, self.sola_buffer[None, None, :])
-        cor_den = torch.sqrt(F.conv1d(conv_input**2, self.sola_den_kernel) + 1e-8)
-        if sys.platform == "darwin":
-            _, sola_offset = torch.max(cor_nom[0, 0] / cor_den[0, 0])
-            sola_offset = sola_offset.item()
-        else:
-            sola_offset = torch.argmax(cor_nom[0, 0] / cor_den[0, 0])
-        infer_wav = infer_wav[sola_offset:]
-        infer_wav[: self.sola_buffer_frame] *= self.fade_in_window
-        infer_wav[: self.sola_buffer_frame] += self.sola_buffer * self.fade_out_window
-        self.sola_buffer[:] = infer_wav[
-            self.block_frame : self.block_frame + self.sola_buffer_frame
-        ]
-        output_block = torch.clamp(
-            infer_wav[: self.block_frame] * settings.output_gain, -1.0, 1.0
-        )
+        if self.chunk_tap is not None:
+            self.chunk_tap(infer_wav)
+        # WSOLA: align with the previous chunk's natural continuation and
+        # crossfade over a fixed 40 ms (tools/splice.py).
+        infer_wav = self.splicer.splice(infer_wav)
+        self.record_seam(self.splicer.last_confidence)
+        if self.stale_samples > 0:
+            self.mute_stale_output(infer_wav)
+        return self.finish_block(infer_wav, start_time)
+
+    def input_denoise_delay(self):
+        """Latency the active input denoiser adds, in seconds."""
+        if getattr(self, "rnnoise", None) is not None:
+            return RNNOISE_DELAY_SECONDS
+        return FADE_SECONDS
+
+    def block_is_silent(self, mono):
+        """True when every 10 ms frame of the block is below the hold level."""
+        threshold_db = max(self.settings.noise_gate_db, HOLD_THRESHOLD_DB)
+        frames = mono[: (mono.shape[0] // self.zc) * self.zc].reshape(-1, self.zc)
+        if frames.shape[0] == 0:
+            return False
+        rms = np.sqrt(np.mean(np.square(frames, dtype=np.float32), axis=1))
+        return bool(np.all(20.0 * np.log10(np.maximum(rms, 1e-10)) < threshold_db))
+
+    def hold_silence(self, start_time):
+        """Emit silence without touching the context, so it survives the pause.
+
+        The first silent block fades out the converted continuation over the
+        usual 40 ms; later ones are pure silence and skip inference entirely.
+        """
+        output = torch.zeros(self.block_frame, device=self.config.device)
+        if not self.context_held:
+            self.context_held = True
+            self.stale_samples = 0
+            tail = min(self.splicer.fade, self.block_frame)
+            output[:tail] = (self.splicer.template * self.splicer.fade_out)[:tail]
+            # Resume from silence: no continuation to match, splice early.
+            self.splicer.reset()
+        return self.finish_block(output, start_time)
+
+    def mute_stale_output(self, output):
+        """Silence output taken from frozen context, then fade in."""
+        muted = min(self.block_frame, max(0, self.stale_samples - self.splicer.last_offset))
+        output[:muted] = 0
+        ramp = min(self.resume_ramp.shape[0], self.block_frame - muted)
+        output[muted : muted + ramp] *= self.resume_ramp[:ramp]
+        self.stale_samples = max(0, self.stale_samples - self.block_frame)
+
+    def finish_block(self, output, start_time):
+        """Apply output gain and file volume, update meters, queue the block."""
+        settings = self.settings
+        output_block = torch.clamp(output[: self.block_frame] * settings.output_gain, -1.0, 1.0)
         output_mono = output_block.cpu().numpy()
         # RVC can restore the source loudness internally (for example through
         # volume-envelope mixing).  Apply the file-player volume after
@@ -1081,6 +1180,22 @@ class RealtimeEngine:
         if self.running:
             self.latest_infer_time = int((time.perf_counter() - start_time) * 1000)
         return output_mono
+
+    def record_seam(self, confidence):
+        """Log seam-confidence statistics about every SEAM_LOG_SECONDS."""
+        self.seam_confidences.append(confidence)
+        if len(self.seam_confidences) * self.settings.block_time < SEAM_LOG_SECONDS:
+            return
+        values = self.seam_confidences
+        self.seam_confidences = []
+        printt(
+            "WSOLA seams: mean confidence %.2f, min %.2f, %d of %d below %.2f",
+            sum(values) / len(values),
+            min(values),
+            sum(value < CONFIDENCE_THRESHOLD for value in values),
+            len(values),
+            CONFIDENCE_THRESHOLD,
+        )
 
     @staticmethod
     def enqueue_audio_target(target, block):
@@ -1199,7 +1314,7 @@ class RealtimeEngine:
             settings = self.settings
             tail_blocks = max(
                 2,
-                int((settings.extra_time + settings.crossfade_time) / settings.block_time) + 2,
+                int((settings.extra_time + FADE_SECONDS) / settings.block_time) + 2,
             )
             try:
                 self.file_audio_source = FileAudioSource(
