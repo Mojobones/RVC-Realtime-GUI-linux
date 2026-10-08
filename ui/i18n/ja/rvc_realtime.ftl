@@ -5,6 +5,10 @@ drop-title = ドロップしてモデルを追加
 drop-detail = .pth ごとに1つのモデルになります。.index も一緒にドロップしてください。
 model-imported = モデルを追加しました: { $names }
 
+## Typed values
+value-click-to-type = クリックして値を入力
+value-invalid = 数値を入力してください
+
 ## Navigation
 page-model = モデル
 page-audio = オーディオ

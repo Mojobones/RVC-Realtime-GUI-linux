@@ -5,6 +5,10 @@ drop-title = Drop to add models
 drop-detail = Each .pth becomes a model; drop its .index file along with it.
 model-imported = Added model: { $names }
 
+## Typed values
+value-click-to-type = Click to type a value
+value-invalid = Enter a number
+
 ## Navigation
 page-model = Model
 page-audio = Audio

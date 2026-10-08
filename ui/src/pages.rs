@@ -6,7 +6,7 @@ use cosmic::widget::{self, settings};
 
 use crate::app::{
     App, Connection, F0_METHODS, Function, INPUT_SOURCES, Message, Num, Page, RECORDING_MODES,
-    Toggle,
+    Toggle, VALUE_INPUT_ID,
 };
 use crate::engine::State;
 use crate::fl;
@@ -16,7 +16,10 @@ const VALUE_WIDTH: f32 = 72.0;
 const METER_WIDTH: f32 = 90.0;
 
 pub fn view(app: &App, page: Page) -> Element<'_, Message> {
-    let Some(state) = app.state.as_ref().filter(|_| matches!(app.connection, Connection::Ready))
+    let Some(state) = app
+        .state
+        .as_ref()
+        .filter(|_| matches!(app.connection, Connection::Ready))
     else {
         return connection_view(app);
     };
@@ -63,8 +66,10 @@ fn page_column<'a>(sections: Vec<Element<'a, Message>>) -> Element<'a, Message> 
     settings::view_column(sections).into()
 }
 
-/// A labelled slider with its formatted value.
+/// A labelled slider with its formatted value.  Clicking the value opens a
+/// field to type an exact one (Enter applies, Escape or clicking away cancels).
 fn slider_item<'a>(
+    app: &'a App,
     title: String,
     num: Num,
     state: &State,
@@ -72,20 +77,47 @@ fn slider_item<'a>(
 ) -> Element<'a, Message> {
     let (min, max, step) = num.range();
     let value = num.get(&state.settings);
-    settings::item(
-        title,
-        widget::row::with_capacity(4)
-            .push(
-                widget::slider(min..=max, value.clamp(min, max), move |v| Message::Num(num, v))
-                    .step(step)
-                    .on_release(Message::NumReleased(num))
-                    .width(Length::Fixed(SLIDER_WIDTH)),
-            )
-            .push(
+    let value_widget: Element<_> = match &app.editing {
+        Some((editing, text)) if *editing == num => {
+            let invalid = num.parse(text).is_none();
+            let mut input = widget::text_input::inline_input("", text.as_str())
+                .id(VALUE_INPUT_ID.clone())
+                .on_input(Message::EditInput)
+                .on_submit(|_| Message::EditSubmit)
+                .on_unfocus(Message::EditCancel)
+                .width(Length::Fixed(VALUE_WIDTH));
+            if invalid {
+                input = input.error(fl!("value-invalid"));
+            }
+            input.into()
+        }
+        _ => widget::tooltip(
+            widget::button::custom(
                 widget::text::body(format(value))
-                    .width(Length::Fixed(VALUE_WIDTH))
+                    .width(Length::Fill)
                     .align_x(Alignment::End),
             )
+            .class(cosmic::theme::Button::Text)
+            .padding([2, 4])
+            .width(Length::Fixed(VALUE_WIDTH))
+            .on_press(Message::EditValue(num)),
+            widget::text::caption(fl!("value-click-to-type")),
+            widget::tooltip::Position::Top,
+        )
+        .into(),
+    };
+    settings::item(
+        title,
+        widget::row::with_capacity(2)
+            .push(
+                widget::slider(min..=max, value.clamp(min, max), move |v| {
+                    Message::Num(num, v)
+                })
+                .step(step)
+                .on_release(Message::NumReleased(num))
+                .width(Length::Fixed(SLIDER_WIDTH)),
+            )
+            .push(value_widget)
             .spacing(cosmic::theme::spacing().space_xs)
             .align_y(Alignment::Center),
     )
@@ -171,18 +203,58 @@ fn model_page<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
             .into(),
         settings::section()
             .title(fl!("section-voice"))
-            .add(slider_item(fl!("pitch"), Num::Pitch, state, signed(1)))
-            .add(slider_item(fl!("formant"), Num::Formant, state, signed(2)))
-            .add(slider_item(fl!("index-rate"), Num::IndexRate, state, ratio))
+            .add(slider_item(app, fl!("pitch"), Num::Pitch, state, signed(1)))
+            .add(slider_item(
+                app,
+                fl!("formant"),
+                Num::Formant,
+                state,
+                signed(2),
+            ))
+            .add(slider_item(
+                app,
+                fl!("index-rate"),
+                Num::IndexRate,
+                state,
+                ratio,
+            ))
             .into(),
         settings::section()
             .title(fl!("section-levels"))
-            .add(slider_item(fl!("input-gain"), Num::InputGain, state, decibels))
-            .add(slider_item(fl!("output-gain"), Num::OutputGain, state, decibels))
-            .add(slider_item(fl!("monitor-gain"), Num::MonitorGain, state, decibels))
-            .add(slider_item(fl!("noise-gate"), Num::NoiseGate, state, |value| {
-                if value <= -60.0 { fl!("off") } else { format!("{value:.0} dB") }
-            }))
+            .add(slider_item(
+                app,
+                fl!("input-gain"),
+                Num::InputGain,
+                state,
+                decibels,
+            ))
+            .add(slider_item(
+                app,
+                fl!("output-gain"),
+                Num::OutputGain,
+                state,
+                decibels,
+            ))
+            .add(slider_item(
+                app,
+                fl!("monitor-gain"),
+                Num::MonitorGain,
+                state,
+                decibels,
+            ))
+            .add(slider_item(
+                app,
+                fl!("noise-gate"),
+                Num::NoiseGate,
+                state,
+                |value| {
+                    if value <= -60.0 {
+                        fl!("off")
+                    } else {
+                        format!("{value:.0} dB")
+                    }
+                },
+            ))
             .into(),
         reset_row(fl!("reset-model-settings"), "general"),
     ])
@@ -203,14 +275,18 @@ fn audio_page<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
     let space = cosmic::theme::spacing();
     let settings_ = &state.settings;
     let file_source = settings_.input_source == "file";
-    let source_index = INPUT_SOURCES.iter().position(|s| *s == settings_.input_source);
+    let source_index = INPUT_SOURCES
+        .iter()
+        .position(|s| *s == settings_.input_source);
 
-    let mut input = settings::section().title(fl!("section-input")).add(dropdown_item(
-        fl!("input-source"),
-        &app.source_labels,
-        source_index,
-        Message::SelectInputSource,
-    ));
+    let mut input = settings::section()
+        .title(fl!("section-input"))
+        .add(dropdown_item(
+            fl!("input-source"),
+            &app.source_labels,
+            source_index,
+            Message::SelectInputSource,
+        ));
     if file_source && !state.ffmpeg {
         input = input.add(widget::text::body(fl!("error-ffmpeg-missing")));
     }
@@ -226,17 +302,18 @@ fn audio_page<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
             fl!("audio-file"),
             widget::row::with_capacity(4)
                 .push(widget::text::body(file_name))
-                .push(
-                    widget::button::standard(fl!("browse"))
-                        .on_press(Message::PickAudioFile),
-                )
+                .push(widget::button::standard(fl!("browse")).on_press(Message::PickAudioFile))
                 .spacing(space.space_s)
                 .align_y(Alignment::Center),
         ));
         input = input.add(file_player(app, state));
-        input = input.add(slider_item(fl!("file-volume"), Num::FileVolume, state, |value| {
-            format!("{:.0}%", value * 100.0)
-        }));
+        input = input.add(slider_item(
+            app,
+            fl!("file-volume"),
+            Num::FileVolume,
+            state,
+            |value| format!("{:.0}%", value * 100.0),
+        ));
     } else {
         input = input.add(dropdown_item(
             fl!("input-device"),
@@ -273,7 +350,10 @@ fn audio_page<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
         input.into(),
         output.into(),
         widget::row::with_capacity(4)
-            .push(widget::text::caption(format!("{}\n{}", rate, fl!("jack-hint"))).width(Length::Fill))
+            .push(
+                widget::text::caption(format!("{}\n{}", rate, fl!("jack-hint")))
+                    .width(Length::Fill),
+            )
             .push(
                 widget::button::standard(fl!("reload-devices"))
                     .leading_icon(widget::icon::from_name("view-refresh-symbolic"))
@@ -327,19 +407,49 @@ fn file_player<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
 fn performance_page<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
     let settings_ = &state.settings;
     let gpu_index = state.gpus.iter().position(|gpu| gpu.id == settings_.gpu);
-    let f0_index = F0_METHODS.iter().position(|method| *method == settings_.f0method);
+    let f0_index = F0_METHODS
+        .iter()
+        .position(|method| *method == settings_.f0method);
     page_column(vec![
         settings::section()
             .title(fl!("section-buffering"))
-            .add(slider_item(fl!("chunk"), Num::BlockTime, state, seconds))
-            .add(slider_item(fl!("crossfade"), Num::Crossfade, state, seconds))
-            .add(slider_item(fl!("extra"), Num::Extra, state, seconds))
+            .add(slider_item(
+                app,
+                fl!("chunk"),
+                Num::BlockTime,
+                state,
+                seconds,
+            ))
+            .add(slider_item(
+                app,
+                fl!("crossfade"),
+                Num::Crossfade,
+                state,
+                seconds,
+            ))
+            .add(slider_item(app, fl!("extra"), Num::Extra, state, seconds))
             .into(),
         settings::section()
             .title(fl!("section-inference"))
-            .add(dropdown_item(fl!("pitch-detector"), &app.f0_labels, f0_index, Message::SelectF0))
-            .add(slider_item(fl!("volume-envelope"), Num::RmsMix, state, ratio))
-            .add(dropdown_item(fl!("gpu"), &app.gpu_labels, gpu_index, Message::SelectGpu))
+            .add(dropdown_item(
+                fl!("pitch-detector"),
+                &app.f0_labels,
+                f0_index,
+                Message::SelectF0,
+            ))
+            .add(slider_item(
+                app,
+                fl!("volume-envelope"),
+                Num::RmsMix,
+                state,
+                ratio,
+            ))
+            .add(dropdown_item(
+                fl!("gpu"),
+                &app.gpu_labels,
+                gpu_index,
+                Message::SelectGpu,
+            ))
             .into(),
         settings::section()
             .title(fl!("section-noise"))
@@ -365,7 +475,9 @@ fn performance_page<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> 
 fn recording_page<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
     let space = cosmic::theme::spacing();
     let settings_ = &state.settings;
-    let mode_index = RECORDING_MODES.iter().position(|mode| *mode == settings_.recording_mode);
+    let mode_index = RECORDING_MODES
+        .iter()
+        .position(|mode| *mode == settings_.recording_mode);
     let record_button = if state.recording {
         widget::button::destructive(fl!("stop-recording"))
             .leading_icon(widget::icon::from_name("media-playback-stop-symbolic"))
@@ -437,11 +549,9 @@ fn log_page(app: &App) -> Element<'_, Message> {
         )
         .push(
             widget::container(
-                widget::scrollable(
-                    widget::text::monotext(app.log.as_str()).width(Length::Fill),
-                )
-                .anchor_bottom()
-                .height(Length::Fill),
+                widget::scrollable(widget::text::monotext(app.log.as_str()).width(Length::Fill))
+                    .anchor_bottom()
+                    .height(Length::Fill),
             )
             .class(cosmic::theme::Container::Card)
             .padding(space.space_s)
@@ -467,8 +577,12 @@ pub fn control_bar<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
         widget::button::destructive(fl!("converting"))
             .leading_icon(widget::icon::from_name("media-playback-stop-symbolic"))
     } else {
-        widget::button::suggested(if app.starting { fl!("starting") } else { fl!("start") })
-            .leading_icon(widget::icon::from_name("media-playback-start-symbolic"))
+        widget::button::suggested(if app.starting {
+            fl!("starting")
+        } else {
+            fl!("start")
+        })
+        .leading_icon(widget::icon::from_name("media-playback-start-symbolic"))
     }
     .on_press_maybe(enabled.then_some(Message::Run(Function::Convert)));
     let passthrough_button = if passthrough {
@@ -504,7 +618,11 @@ pub fn control_bar<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
         )))
         .push(widget::text::caption(fl!(
             "inference",
-            value = app.meters.infer_ms.map(|ms| ms.to_string()).unwrap_or_else(dash)
+            value = app
+                .meters
+                .infer_ms
+                .map(|ms| ms.to_string())
+                .unwrap_or_else(dash)
         )))
         .width(Length::Fixed(120.0));
 

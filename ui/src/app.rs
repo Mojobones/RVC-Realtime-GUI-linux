@@ -17,6 +17,10 @@ use crate::pages;
 pub const APP_ID: &str = "io.github.rvc_realtime.RvcRealtime";
 const MAX_LOG_CHARS: usize = 40_000;
 
+/// The one inline field used to type a slider value.
+pub static VALUE_INPUT_ID: std::sync::LazyLock<widget::Id> =
+    std::sync::LazyLock::new(|| widget::Id::new("slider-value-input"));
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Page {
     Model,
@@ -90,6 +94,39 @@ impl Num {
             Num::Extra => (0.05, 5.0, 0.01),
             Num::FileVolume => (0.0, 1.0, 0.01),
         }
+    }
+
+    /// The value as plain text for the edit field (no unit or sign padding).
+    pub fn edit_text(self, value: f32) -> String {
+        let shown = if self == Num::FileVolume {
+            value * 100.0
+        } else {
+            value
+        };
+        let text = format!("{shown:.3}");
+        text.trim_end_matches('0').trim_end_matches('.').to_string()
+    }
+
+    /// Parse a typed value: units, a leading `+`, and a decimal comma are
+    /// accepted, `off` means -60 dB for the noise gate, and the file volume is
+    /// typed in percent.  The result is clamped to the slider's range.
+    pub fn parse(self, text: &str) -> Option<f32> {
+        let (min, max, _) = self.range();
+        let text = text.trim().to_lowercase();
+        if self == Num::NoiseGate && (text == "off" || text == fl!("off").to_lowercase()) {
+            return Some(min);
+        }
+        let number = text
+            .trim_end_matches(['%', 's'])
+            .trim_end_matches("db")
+            .trim()
+            .trim_start_matches('+')
+            .replace(',', ".");
+        let mut value: f32 = number.parse().ok().filter(|v: &f32| v.is_finite())?;
+        if self == Num::FileVolume {
+            value /= 100.0;
+        }
+        Some(value.clamp(min, max))
     }
 
     /// Changing these stops a running stream, so they are sent on release.
@@ -176,6 +213,11 @@ pub enum Message {
     Engine(engine::Event),
     Num(Num, f32),
     NumReleased(Num),
+    /// Clicked a slider's value to type one instead.
+    EditValue(Num),
+    EditInput(String),
+    EditSubmit,
+    EditCancel,
     Toggle(Toggle, bool),
     SelectModel(usize),
     SelectGpu(usize),
@@ -225,6 +267,8 @@ pub struct App {
     /// Slider being dragged; its local value wins over incoming state.
     dragging: Option<Num>,
     pub seek_preview: Option<f32>,
+    /// Slider value being typed in, with its text so far.
+    pub editing: Option<(Num, String)>,
     pub starting: bool,
     pub drag_hover: bool,
     pending: HashMap<u64, Pending>,
@@ -261,8 +305,16 @@ impl cosmic::Application for App {
         for (page, title, icon) in [
             (Page::Model, fl!("page-model"), "avatar-default-symbolic"),
             (Page::Audio, fl!("page-audio"), "audio-card-symbolic"),
-            (Page::Performance, fl!("page-performance"), "speedometer-symbolic"),
-            (Page::Recording, fl!("page-recording"), "media-record-symbolic"),
+            (
+                Page::Performance,
+                fl!("page-performance"),
+                "speedometer-symbolic",
+            ),
+            (
+                Page::Recording,
+                fl!("page-recording"),
+                "media-record-symbolic",
+            ),
             (Page::Log, fl!("page-log"), "utilities-terminal-symbolic"),
         ] {
             nav.insert()
@@ -282,6 +334,7 @@ impl cosmic::Application for App {
             status: String::new(),
             dragging: None,
             seek_preview: None,
+            editing: None,
             starting: false,
             drag_hover: false,
             pending: HashMap::new(),
@@ -337,6 +390,38 @@ impl cosmic::Application for App {
                     self.send_setting(num.key(), json!(value));
                 }
             }
+            Message::EditValue(num) => {
+                let Some(state) = &self.state else {
+                    return Task::none();
+                };
+                self.editing = Some((num, num.edit_text(num.get(&state.settings))));
+                let id = VALUE_INPUT_ID.clone();
+                return Task::batch([
+                    widget::text_input::focus(id.clone()),
+                    widget::text_input::select_all(id),
+                ]);
+            }
+            Message::EditInput(text) => {
+                if let Some((_, current)) = &mut self.editing {
+                    *current = text;
+                }
+            }
+            Message::EditSubmit => {
+                let Some((num, text)) = self.editing.take() else {
+                    return Task::none();
+                };
+                match num.parse(&text) {
+                    Some(value) => {
+                        if let Some(state) = &mut self.state {
+                            num.set(&mut state.settings, value);
+                        }
+                        self.send_setting(num.key(), json!(value));
+                    }
+                    // Keep the field open so the typo can be fixed.
+                    None => self.editing = Some((num, text)),
+                }
+            }
+            Message::EditCancel => self.editing = None,
             Message::Toggle(toggle, value) => self.send_setting(toggle.key(), json!(value)),
             Message::SelectModel(index) => {
                 if let Some(name) = self.model_names.get(index).cloned() {
@@ -444,7 +529,8 @@ impl cosmic::Application for App {
                 if let Some(state) = &self.state {
                     let folder = state.settings.recording_folder.clone();
                     let _ = std::fs::create_dir_all(&folder);
-                    if let Err(error) = std::process::Command::new("xdg-open").arg(&folder).spawn() {
+                    if let Err(error) = std::process::Command::new("xdg-open").arg(&folder).spawn()
+                    {
                         return self.toast(error.to_string());
                     }
                 }
@@ -479,7 +565,11 @@ impl cosmic::Application for App {
     }
 
     fn view(&self) -> Element<'_, Message> {
-        let page = self.nav.active_data::<Page>().copied().unwrap_or(Page::Model);
+        let page = self
+            .nav
+            .active_data::<Page>()
+            .copied()
+            .unwrap_or(Page::Model);
         let mut content = cosmic::iced::widget::Stack::new().push(pages::view(self, page));
         if self.drag_hover {
             content = content.push(pages::drop_overlay());
@@ -495,7 +585,9 @@ impl cosmic::Application for App {
     }
 
     fn footer(&self) -> Option<Element<'_, Message>> {
-        self.state.as_ref().map(|state| pages::control_bar(self, state))
+        self.state
+            .as_ref()
+            .map(|state| pages::control_bar(self, state))
     }
 }
 
@@ -524,7 +616,9 @@ impl App {
     }
 
     fn toast(&mut self, text: String) -> Task<Message> {
-        self.toasts.push(toaster::Toast::new(text)).map(cosmic::Action::App)
+        self.toasts
+            .push(toaster::Toast::new(text))
+            .map(cosmic::Action::App)
     }
 
     fn apply_state(&mut self, mut state: State) {
@@ -537,8 +631,18 @@ impl App {
             .iter()
             .map(|gpu| gpu.label.clone().unwrap_or_else(|| fl!("gpu-automatic")))
             .collect();
-        self.input_labels = state.devices.inputs.iter().map(|d| d.label.clone()).collect();
-        self.output_labels = state.devices.outputs.iter().map(|d| d.label.clone()).collect();
+        self.input_labels = state
+            .devices
+            .inputs
+            .iter()
+            .map(|d| d.label.clone())
+            .collect();
+        self.output_labels = state
+            .devices
+            .outputs
+            .iter()
+            .map(|d| d.label.clone())
+            .collect();
         self.monitor_labels = std::iter::once(fl!("monitor-disabled"))
             .chain(self.output_labels.iter().cloned())
             .collect();
@@ -672,7 +776,12 @@ fn pick(target: PickTarget, title: String) -> Task<Message> {
 
 /// Translate an engine status code.
 pub fn status_text(code: &str, data: &Value) -> String {
-    let text = |key: &str| data.get(key).and_then(Value::as_str).unwrap_or_default().to_string();
+    let text = |key: &str| {
+        data.get(key)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
     match code {
         "preparing" => fl!("status-preparing"),
         "loading_model" => fl!("status-loading-model"),
@@ -720,5 +829,44 @@ pub fn error_text(error: &ErrorInfo) -> String {
         "import_no_model_file" => fl!("error-import-no-model-file"),
         "import_failed" => fl!("error-import-failed", detail = error.message.clone()),
         _ => error.message.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Num;
+
+    #[test]
+    fn parses_typed_values_with_units_signs_and_commas() {
+        assert_eq!(Num::Pitch.parse("+11.5"), Some(11.5));
+        assert_eq!(Num::Pitch.parse(" -3,25 "), Some(-3.25));
+        assert_eq!(Num::OutputGain.parse("-6 dB"), Some(-6.0));
+        assert_eq!(Num::BlockTime.parse("0.3s"), Some(0.3));
+        assert_eq!(Num::FileVolume.parse("50%"), Some(0.5));
+        assert_eq!(Num::NoiseGate.parse("Off"), Some(-60.0));
+    }
+
+    #[test]
+    fn clamps_to_the_slider_range_and_rejects_garbage() {
+        assert_eq!(Num::Pitch.parse("40"), Some(24.0));
+        assert_eq!(Num::IndexRate.parse("-1"), Some(0.0));
+        assert_eq!(Num::Pitch.parse("high"), None);
+        assert_eq!(Num::Pitch.parse(""), None);
+        assert_eq!(Num::Pitch.parse("NaN"), None);
+    }
+
+    #[test]
+    fn edit_text_is_plain_and_round_trips() {
+        assert_eq!(Num::Pitch.edit_text(11.5), "11.5");
+        assert_eq!(Num::Pitch.edit_text(12.0), "12");
+        assert_eq!(Num::FileVolume.edit_text(0.25), "25");
+        for (num, value) in [
+            (Num::Pitch, -7.3),
+            (Num::Formant, 0.05),
+            (Num::FileVolume, 0.8),
+        ] {
+            let parsed = num.parse(&num.edit_text(value)).unwrap();
+            assert!((parsed - value).abs() < 1e-4, "{num:?} {value} -> {parsed}");
+        }
     }
 }

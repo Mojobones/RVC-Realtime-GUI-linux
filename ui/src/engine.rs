@@ -119,15 +119,24 @@ pub enum Event {
     /// The connection dropped or the engine could not be started.
     Disconnected(String),
     /// Sent once per connection; `state` is `None` while the engine starts.
-    Hello { state: Option<Box<State>>, init_error: Option<String> },
+    Hello {
+        state: Option<Box<State>>,
+        init_error: Option<String>,
+    },
     Ready(Box<State>),
     Fatal(String),
     State(Box<State>),
     Meters(Meters),
-    Status { code: String, data: Value },
+    Status {
+        code: String,
+        data: Value,
+    },
     Error(ErrorInfo),
     Log(String),
-    Response { id: u64, result: Result<Value, ErrorInfo> },
+    Response {
+        id: u64,
+        result: Result<Value, ErrorInfo>,
+    },
 }
 
 /// Sends commands to the engine; cheap to clone.
@@ -162,7 +171,9 @@ pub fn socket_path() -> PathBuf {
 
 fn current_uid() -> u32 {
     use std::os::unix::fs::MetadataExt;
-    std::fs::metadata("/proc/self").map(|meta| meta.uid()).unwrap_or(0)
+    std::fs::metadata("/proc/self")
+        .map(|meta| meta.uid())
+        .unwrap_or(0)
 }
 
 /// The repository root: `RVC_PROJECT_DIR`, or the first ancestor of the
@@ -171,19 +182,13 @@ pub fn project_dir() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("RVC_PROJECT_DIR") {
         return Some(PathBuf::from(dir));
     }
-    let starts = [
-        std::env::current_exe().ok(),
-        std::env::current_dir().ok(),
-    ];
-    starts
-        .into_iter()
-        .flatten()
-        .find_map(|start| {
-            start
-                .ancestors()
-                .find(|dir| dir.join("engine").join("server.py").is_file())
-                .map(Path::to_path_buf)
-        })
+    let starts = [std::env::current_exe().ok(), std::env::current_dir().ok()];
+    starts.into_iter().flatten().find_map(|start| {
+        start
+            .ancestors()
+            .find(|dir| dir.join("engine").join("server.py").is_file())
+            .map(Path::to_path_buf)
+    })
 }
 
 fn spawn_engine(socket: &Path) -> Result<(), String> {
@@ -192,10 +197,19 @@ fn spawn_engine(socket: &Path) -> Result<(), String> {
     })?;
     let python = root.join(".venv").join("bin").join("python");
     if !python.is_file() {
-        return Err(format!("Python environment not found: {}", python.display()));
+        return Err(format!(
+            "Python environment not found: {}",
+            python.display()
+        ));
     }
     tokio::process::Command::new(&python)
-        .args(["-m", "engine.server", "--exit-when-idle", ENGINE_IDLE_EXIT_SECONDS, "--socket"])
+        .args([
+            "-m",
+            "engine.server",
+            "--exit-when-idle",
+            ENGINE_IDLE_EXIT_SECONDS,
+            "--socket",
+        ])
         .arg(socket)
         .current_dir(&root)
         .stdin(std::process::Stdio::null())
@@ -217,7 +231,10 @@ async fn connect() -> Result<UnixStream, String> {
         match UnixStream::connect(&socket).await {
             Ok(stream) => return Ok(stream),
             Err(error) if tokio::time::Instant::now() >= deadline => {
-                return Err(format!("The engine did not open {}: {error}", socket.display()));
+                return Err(format!(
+                    "The engine did not open {}: {error}",
+                    socket.display()
+                ));
             }
             Err(_) => {}
         }
@@ -240,7 +257,10 @@ fn parse_line(line: &str) -> Option<Event> {
     Some(match event {
         "hello" => Event::Hello {
             state: data.get("state").cloned().and_then(state),
-            init_error: data.get("init_error").and_then(Value::as_str).map(String::from),
+            init_error: data
+                .get("init_error")
+                .and_then(Value::as_str)
+                .map(String::from),
         },
         "ready" => Event::Ready(state(data)?),
         "state" => Event::State(state(data)?),
@@ -271,7 +291,10 @@ pub fn connection() -> impl Stream<Item = Event> {
             };
             let (read_half, mut write_half) = stream.into_split();
             let (sender, mut receiver) = mpsc::unbounded_channel::<String>();
-            let handle = Handle { sender, next_id: next_id.clone() };
+            let handle = Handle {
+                sender,
+                next_id: next_id.clone(),
+            };
             let _ = output.send(Event::Connected(handle)).await;
 
             let writer = tokio::spawn(async move {
@@ -308,7 +331,10 @@ mod tests {
     #[test]
     fn parses_responses() {
         match parse_line(r#"{"id":3,"ok":true,"result":{"paths":["a.wav"]}}"#) {
-            Some(Event::Response { id: 3, result: Ok(value) }) => {
+            Some(Event::Response {
+                id: 3,
+                result: Ok(value),
+            }) => {
                 assert_eq!(value["paths"][0], "a.wav");
             }
             other => panic!("unexpected {other:?}"),
@@ -316,7 +342,10 @@ mod tests {
         match parse_line(
             r#"{"id":4,"ok":false,"error":{"code":"no_model","message":"m","details":{}}}"#,
         ) {
-            Some(Event::Response { id: 4, result: Err(error) }) => assert_eq!(error.code, "no_model"),
+            Some(Event::Response {
+                id: 4,
+                result: Err(error),
+            }) => assert_eq!(error.code, "no_model"),
             other => panic!("unexpected {other:?}"),
         }
     }
@@ -328,8 +357,13 @@ mod tests {
             Some(Event::Meters(Meters { input, file_position: Some(_), .. })) if input == 0.5
         ));
         assert!(matches!(
-            parse_line(r#"{"event":"hello","data":{"protocol":1,"ready":false,"init_error":null,"state":null}}"#),
-            Some(Event::Hello { state: None, init_error: None })
+            parse_line(
+                r#"{"event":"hello","data":{"protocol":1,"ready":false,"init_error":null,"state":null}}"#
+            ),
+            Some(Event::Hello {
+                state: None,
+                init_error: None
+            })
         ));
         assert!(parse_line(r#"{"event":"future_thing","data":{}}"#).is_none());
         assert!(parse_line("not json").is_none());
