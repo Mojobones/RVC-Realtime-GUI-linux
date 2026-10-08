@@ -25,7 +25,6 @@ import torch
 import torch.nn.functional as F
 import torchaudio.transforms as tat
 
-from app.version import APP_TITLE, BUILD_LABEL
 from configs.config import Config, get_device_dtype_sm, infer_device
 from engine.devices import DeviceCatalog
 from engine.settings import (
@@ -41,8 +40,9 @@ from engine.settings import (
     save_model_settings,
     save_settings,
 )
+from engine.version import APP_TITLE, BUILD_LABEL
 from infer import rtrvc as rvc_for_realtime
-from tools.audio_fifo import AudioFrameFifo
+from tools.audio_fifo import AudioFrameFifo, enqueue_latest
 from tools.audio_routing import is_native_api, scatter_mono, select_channels
 from tools.cuda_graph import cuda_graph_enabled, run_cuda_graph
 from tools.file_audio_source import FileAudioSource
@@ -71,22 +71,6 @@ def printt(strr, *args):
         print(strr)
     else:
         print(strr % args)
-
-
-def enqueue_latest(block_queue, block):
-    try:
-        block_queue.put_nowait(block)
-        return
-    except queue.Full:
-        pass
-    try:
-        block_queue.get_nowait()
-    except queue.Empty:
-        pass
-    try:
-        block_queue.put_nowait(block)
-    except queue.Full:
-        pass
 
 
 def peak_meter(samples):

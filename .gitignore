@@ -5,7 +5,6 @@ logs/
 recordings/
 configs/config.json
 configs/engine.json
-configs/window.json
 models/*/
 !models/README.md
 

@@ -1,4 +1,5 @@
 from collections import deque
+import queue
 import threading
 
 import numpy as np
@@ -73,3 +74,20 @@ class AudioFrameFifo:
                 self._chunks[0] = chunk[count:]
             self._frames -= count
             remaining -= count
+
+
+def enqueue_latest(block_queue, block):
+    """Put a block on a bounded queue, dropping the oldest one when full."""
+    try:
+        block_queue.put_nowait(block)
+        return
+    except queue.Full:
+        pass
+    try:
+        block_queue.get_nowait()
+    except queue.Empty:
+        pass
+    try:
+        block_queue.put_nowait(block)
+    except queue.Full:
+        pass
