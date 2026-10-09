@@ -42,6 +42,23 @@ pub struct State {
     /// Whether input noise reduction can use RNNoise (otherwise spectral gating).
     #[serde(default)]
     pub rnnoise: bool,
+    /// The user's pitch, measured live from the microphone.
+    #[serde(default)]
+    pub voice_pitch: VoicePitch,
+    /// A source clip is being analysed in the background.
+    #[serde(default)]
+    pub analyzing_pitch: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq)]
+pub struct VoicePitch {
+    /// Median pitch in Hz; `None` until enough speech has been heard.
+    pub median_hz: Option<f32>,
+    /// Voiced speech measured so far, in seconds.
+    pub seconds: f32,
+    /// Voiced speech needed before the median is reported.
+    #[serde(default)]
+    pub needed_seconds: f32,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -59,8 +76,13 @@ pub struct Settings {
     pub hold_context: bool,
     #[serde(default = "default_hold_detector")]
     pub hold_detector: String,
+    /// Output-level target: `"voice_chat"` (-21 LUFS) or `"streaming"` (-16).
+    #[serde(default = "default_loudness_target")]
+    pub loudness_target: String,
     pub rms_mix_rate: f32,
     pub f0method: String,
+    #[serde(default = "default_true")]
+    pub pitch_smoothing: bool,
     pub recording_folder: String,
     pub recording_mode: String,
     pub file_input_volume: f32,
@@ -71,10 +93,27 @@ pub struct Settings {
     pub pitch: f32,
     pub formant: f32,
     pub index_rate: f32,
+    #[serde(default = "default_protect")]
+    pub protect: f32,
+    /// Median pitch of the model's source speaker in Hz (0 = not measured).
+    #[serde(default)]
+    pub source_pitch_hz: f32,
+}
+
+fn default_protect() -> f32 {
+    0.33
 }
 
 fn default_hold_detector() -> String {
     "level".to_string()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_loudness_target() -> String {
+    "voice_chat".to_string()
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -82,6 +121,12 @@ pub struct Model {
     pub name: String,
     pub model_file: String,
     pub index_file: Option<String>,
+    /// Size of the model file in bytes.
+    #[serde(default)]
+    pub size_bytes: u64,
+    /// Modification time of the model file (Unix seconds).
+    #[serde(default)]
+    pub modified: i64,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -114,8 +159,32 @@ pub struct Meters {
     pub output: f32,
     pub monitor: f32,
     pub infer_ms: Option<u32>,
+    /// Audio waiting between the mic and the output right now.
+    #[serde(default)]
+    pub queued_ms: Option<u32>,
     pub recording_seconds: Option<f64>,
     pub file_position: Option<f64>,
+    #[serde(default)]
+    pub voice_pitch: Option<VoicePitch>,
+    /// How loud the output sounds to others (tools/loudness.py).
+    #[serde(default)]
+    pub loudness: Option<Loudness>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct Loudness {
+    /// Speech loudness at the current output gain; `None` before any speech.
+    pub lufs: Option<f32>,
+    /// The loudness aimed for (LUFS).
+    #[serde(default)]
+    pub target_lufs: f32,
+    pub speech_seconds: f32,
+    /// Share of speech samples over full scale (squashed by the clipper).
+    pub over_percent: f32,
+    /// `"quiet"`, `"good"` or `"loud"`; `None` until enough speech is heard.
+    pub verdict: Option<String>,
+    /// Output-gain change (dB) that reaches the target.
+    pub adjust_db: f32,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -379,6 +448,17 @@ mod tests {
                 init_error: None
             })
         ));
+        match parse_line(
+            r#"{"event":"meters","data":{"input":0,"output":0,"monitor":0,"infer_ms":20,"recording_seconds":null,"file_position":null,"voice_pitch":{"median_hz":114.0,"seconds":31.0,"needed_seconds":20},"loudness":{"lufs":-23.7,"speech_seconds":12.3,"over_percent":0.0,"verdict":"quiet","adjust_db":7.5}}}"#,
+        ) {
+            Some(Event::Meters(meters)) => {
+                let loudness = meters.loudness.expect("loudness");
+                assert_eq!(loudness.verdict.as_deref(), Some("quiet"));
+                assert_eq!(loudness.adjust_db, 7.5);
+                assert_eq!(meters.voice_pitch.and_then(|v| v.median_hz), Some(114.0));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
         assert!(parse_line(r#"{"event":"future_thing","data":{}}"#).is_none());
         assert!(parse_line("not json").is_none());
     }

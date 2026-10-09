@@ -481,6 +481,52 @@ class MelSpectrogram(torch.nn.Module):
         return log_mel_spec
 
 
+#: Viterbi pitch tracking (as in penn and torchcrepe): the most likely path
+#: through RMVPE's 360 pitch bins (20 cents apart) instead of each frame's own
+#: peak.  A path may move at most this many bins per 10 ms frame (12 bins =
+#: 240 cents, about 2.2 semitones), with smaller moves more likely.
+VITERBI_MAX_JUMP_BINS = 12
+
+
+def viterbi_bins(salience, max_jump=VITERBI_MAX_JUMP_BINS):
+    """Most likely bin per frame through ``salience`` [frames, bins] (0..1)."""
+    frames, bins = salience.shape
+    salience = np.asarray(salience, dtype=np.float64)
+    observation = np.log(salience / (salience.sum(axis=1, keepdims=True) + 1e-12) + 1e-12)
+    reach = max_jump - 1
+    offsets = np.arange(-reach, reach + 1)
+    weights = (max_jump - np.abs(offsets)).astype(np.float64)
+    log_transition = np.log(weights / weights.sum())
+    back = np.empty((frames, bins), dtype=np.int64)
+    score = observation[0].copy()
+    padded = np.full(bins + 2 * reach, -np.inf)
+    for t in range(1, frames):
+        padded[reach : reach + bins] = score
+        # Row j: scores of previous bins j - reach .. j + reach, plus the
+        # cost of moving from each of them to j.
+        candidates = np.lib.stride_tricks.sliding_window_view(padded, 2 * reach + 1) + log_transition
+        best = np.argmax(candidates, axis=1)
+        back[t] = np.arange(bins) + best - reach
+        score = candidates[np.arange(bins), best] + observation[t]
+    path = np.empty(frames, dtype=np.int64)
+    path[-1] = int(np.argmax(score))
+    for t in range(frames - 1, 0, -1):
+        path[t - 1] = back[t, path[t]]
+    return path
+
+
+def voiced_viterbi_bins(salience, thred, max_jump=VITERBI_MAX_JUMP_BINS):
+    """Viterbi within each run of voiced frames (peak salience above
+    ``thred``); a path restarts after every unvoiced gap, whose salience
+    carries no pitch.  Unvoiced frames keep their own peak bin."""
+    center = np.argmax(salience, axis=1)
+    voiced = np.max(salience, axis=1) > thred
+    edges = np.flatnonzero(np.diff(np.r_[0, voiced.astype(np.int8), 0]))
+    for start, stop in zip(edges[::2], edges[1::2]):
+        center[start:stop] = viterbi_bins(salience[start:stop], max_jump)
+    return center
+
+
 class RMVPE:
     def __init__(self, model_path, is_half, device=None):
         self.resample_kernel = {}
@@ -576,14 +622,15 @@ class RMVPE:
             audio,
         )
 
-    def decode(self, hidden, thred=0.03):
-        cents_pred = self.to_local_average_cents(hidden, thred=thred)
+    def decode(self, hidden, thred=0.03, viterbi=False):
+        center = voiced_viterbi_bins(hidden, thred) if viterbi else None
+        cents_pred = self.to_local_average_cents(hidden, thred=thred, center=center)
         f0 = 10 * (2 ** (cents_pred / 1200))
         f0[f0 == 10] = 0
         # f0 = np.array([10 * (2 ** (cent_pred / 1200)) if cent_pred else 0 for cent_pred in cents_pred])
         return f0
 
-    def infer_from_audio(self, audio, thred=0.03):
+    def infer_from_audio(self, audio, thred=0.03, viterbi=False):
         # torch.cuda.synchronize()
         # t0 = ttime()
         mel = self.extract_mel(audio, center=True)
@@ -601,15 +648,18 @@ class RMVPE:
         if self.is_half == True:
             hidden = hidden.astype("float32")
 
-        f0 = self.decode(hidden, thred=thred)
+        f0 = self.decode(hidden, thred=thred, viterbi=viterbi)
         # torch.cuda.synchronize()
         # t3 = ttime()
         # print("hmvpe:%s\t%s\t%s\t%s"%(t1-t0,t2-t1,t3-t2,t3-t0))
         return f0
 
-    def to_local_average_cents(self, salience, thred=0.05):
+    def to_local_average_cents(self, salience, thred=0.05, center=None):
+        """Cents per frame around ``center`` (default: each frame's peak bin)."""
         # t0 = ttime()
-        center = np.argmax(salience, axis=1)  # 帧长#index
+        if center is None:
+            center = np.argmax(salience, axis=1)
+        center = np.array(center)  # 帧长#index
         salience = np.pad(salience, ((0, 0), (4, 4)))  # 帧长,368
         # t1 = ttime()
         center += 4

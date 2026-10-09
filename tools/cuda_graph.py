@@ -1,3 +1,4 @@
+import contextlib
 import logging
 import os
 import threading
@@ -15,6 +16,29 @@ _probe_lock = threading.Lock()
 _probe_result = None
 _capture_streams = {}
 _capture_streams_lock = threading.Lock()
+#: Held while a graph is captured.  While a capture is under way, CUDA work
+#: or memory management from any other thread fails ("operation not permitted
+#: when stream is capturing") and leaves the caching allocator corrupted, so
+#: GPU work outside the audio path (see ``side_gpu_work``) takes it too.
+_capture_lock = threading.RLock()
+_thread_state = threading.local()
+
+
+@contextlib.contextmanager
+def side_gpu_work():
+    """Run GPU work from a thread other than the audio path safely.
+
+    Inside, ``run_cuda_graph`` runs functions eagerly on this thread (no new
+    captures), and the block never overlaps a capture on another thread.
+    Graph replays elsewhere are unaffected and keep running concurrently.
+    """
+    previous = getattr(_thread_state, "eager", False)
+    _thread_state.eager = True
+    try:
+        with _capture_lock:
+            yield
+    finally:
+        _thread_state.eager = previous
 
 
 def _device_type(device):
@@ -65,7 +89,7 @@ def detect_cuda_graph_support(device):
         return False
     cuda_device = _cuda_device(device)
     try:
-        with torch.cuda.device(cuda_device):
+        with _capture_lock, torch.cuda.device(cuda_device):
             current = torch.cuda.current_stream(cuda_device)
             warmup = torch.cuda.Stream(device=cuda_device)
             warmup.wait_stream(current)
@@ -133,7 +157,7 @@ class _CapturedCall:
         for static, value in zip(self.inputs, inputs):
             static.copy_(value)
         device = self.inputs[0].device
-        with torch.cuda.device(device):
+        with _capture_lock, torch.cuda.device(device):
             current = torch.cuda.current_stream(device)
             warmup = torch.cuda.Stream(device=device)
             warmup.wait_stream(current)
@@ -206,7 +230,11 @@ class _GraphCache:
 
 
 def run_cuda_graph(owner, namespace, function, *inputs):
-    if not inputs or not cuda_graph_enabled(inputs[0].device):
+    if (
+        not inputs
+        or getattr(_thread_state, "eager", False)
+        or not cuda_graph_enabled(inputs[0].device)
+    ):
         return function(*inputs)
     cache = getattr(owner, "_rvc_cuda_graph_cache", None)
     if cache is None:

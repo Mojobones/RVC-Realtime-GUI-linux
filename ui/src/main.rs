@@ -4,6 +4,7 @@ mod app;
 mod drop;
 mod engine;
 mod i18n;
+mod library;
 mod pages;
 
 use cosmic::app::Settings;

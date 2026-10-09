@@ -1,9 +1,9 @@
 """Engine settings, defaults, and their JSON persistence.
 
 Global settings live in ``configs/engine.json``.  The per-model settings
-(gains, noise gate, pitch, formant, index rate) live beside each model in
-``realtime_settings.json`` using the same keys as the Tk build, so both
-front ends share them.
+(gains, noise gate, pitch, formant, index rate, protect, measured source
+pitch) live beside each model in ``realtime_settings.json`` using the same
+keys as the Tk build, so both front ends share them.
 """
 
 import json
@@ -21,6 +21,8 @@ RECORDING_MODES = ("separate", "mix", "stereo")
 #: How context hold decides a block is silent: by loudness, or (experimental)
 #: by RNNoise's voice-activity probability.
 HOLD_DETECTORS = ("level", "voice")
+#: Output-level indicator targets (tools/loudness.py TARGETS_LUFS).
+LOUDNESS_TARGETS = ("voice_chat", "streaming")
 
 MODEL_SETTINGS_FILENAME = "realtime_settings.json"
 # Protocol name -> key stored in each model's realtime_settings.json.
@@ -32,8 +34,15 @@ MODEL_SETTING_FILE_KEYS = {
     "pitch": "pitch",
     "formant": "formant",
     "index_rate": "index_rate",
+    "protect": "protect",
+    "source_pitch_hz": "source_pitch_hz",
 }
 MODEL_SETTING_KEYS = tuple(MODEL_SETTING_FILE_KEYS)
+#: "Reset model settings" keeps the measured source pitch: it is a fact
+#: about the model's voice, not a preference.
+RESETTABLE_MODEL_SETTING_KEYS = tuple(
+    key for key in MODEL_SETTING_KEYS if key != "source_pitch_hz"
+)
 
 # Settings that only matter when the next stream starts; changing one stops
 # a running stream, as the Tk build did.
@@ -66,11 +75,17 @@ class EngineSettings:
     #: Freeze the model's past context during silence (see engine/core.py).
     hold_context: bool = True
     hold_detector: str = "level"
+    #: What the output-level indicator aims for: voice chat (-21 LUFS) or
+    #: streaming (-16 LUFS).
+    loudness_target: str = "voice_chat"
     output_denoise: bool = False
     # Keep the original real-time RVC defaults: no envelope post-processing
     # or index blending until the user enables them.
     rms_mix_rate: float = 0.0
     f0method: str = "rmvpe"
+    #: Viterbi pitch tracking for RMVPE (infer/rmvpe.py): the most likely
+    #: continuous pitch path instead of each 10 ms frame's own peak.
+    pitch_smoothing: bool = True
     recording_folder: str = DEFAULT_RECORDING_FOLDER
     recording_mode: str = "separate"
     file_input_volume: float = 1.0
@@ -82,6 +97,11 @@ class EngineSettings:
     pitch: float = 0.0
     formant: float = 0.0
     index_rate: float = 0.0
+    #: RVC's consonant protection (0.5 = off); only matters with index_rate > 0.
+    protect: float = 0.33
+    #: Median pitch of the model's source speaker (Hz, 0 = not measured),
+    #: from a clip analysed with ``analyze_source_pitch``.
+    source_pitch_hz: float = 0.0
 
     @property
     def input_gain(self):
@@ -119,6 +139,7 @@ PERFORMANCE_DEFAULT_KEYS = (
     "hold_detector",
     "rms_mix_rate",
     "f0method",
+    "pitch_smoothing",
 )
 
 
@@ -153,6 +174,10 @@ def coerce_setting(key, value):
             value = max(0.0, value)
         if key in ("rms_mix_rate", "index_rate", "file_input_volume"):
             value = min(max(value, 0.0), 1.0)
+        if key == "protect":
+            value = min(max(value, 0.0), 0.5)
+        if key == "source_pitch_hz":
+            value = max(value, 0.0)
         return value
     if key == "monitor_device":
         if value is not None and not isinstance(value, str):
@@ -165,6 +190,7 @@ def coerce_setting(key, value):
         "input_source": INPUT_SOURCES,
         "recording_mode": RECORDING_MODES,
         "hold_detector": HOLD_DETECTORS,
+        "loudness_target": LOUDNESS_TARGETS,
     }.get(key)
     if allowed and value not in allowed:
         raise SettingError(key, f"{key} must be one of {', '.join(allowed)}")

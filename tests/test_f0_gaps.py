@@ -75,7 +75,7 @@ class DetectorsUseGapFillingTest(unittest.TestCase):
 
     def test_rmvpe(self):
         engine = self.rvc()
-        engine.model_rmvpe = SimpleNamespace(infer_from_audio=lambda x, thred: self.detector_output())
+        engine.model_rmvpe = SimpleNamespace(infer_from_audio=lambda x, thred, viterbi=False: self.detector_output())
         _, pitchf = engine.get_f0_rmvpe(np.zeros(16000, dtype=np.float32), 0)
         self.check(pitchf)
 

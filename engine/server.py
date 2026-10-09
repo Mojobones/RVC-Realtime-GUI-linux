@@ -26,6 +26,10 @@ TICK_SECONDS = 0.05
 MAX_CLIENT_BUFFER_BYTES = 4 * 1024 * 1024
 # sockaddr_un.sun_path is 108 bytes including the terminating NUL.
 MAX_SOCKET_PATH_BYTES = 107
+#: Longest wait for the engine to stop its streams on exit.  Closing an audio
+#: device can hang inside PortAudio/JACK; the settings are saved before that,
+#: so past this the process exits anyway instead of lingering.
+SHUTDOWN_TIMEOUT_SECONDS = 5.0
 
 
 class CommandError(Exception):
@@ -209,6 +213,10 @@ class EngineServer:
             ),
             "reset_settings": lambda args: engine.reset_settings(require(args, "group", str)),
             "reload_models": lambda args: engine.reload_models(),
+            "delete_model": lambda args: engine.delete_model(require(args, "name", str)),
+            "rename_model": lambda args: engine.rename_model(
+                require(args, "name", str), require(args, "new_name", str)
+            ),
             "import_model": lambda args: {"models": engine.import_model(require(args, "paths", list))},
             "reload_devices": lambda args: engine.reload_devices(),
             "start": lambda args: engine.start(args.get("function", "vc")),
@@ -220,6 +228,10 @@ class EngineServer:
             "file_seek": lambda args: engine.file_seek(args.get("seconds")),
             "record_start": lambda args: engine.start_recording(),
             "record_stop": lambda args: {"paths": engine.stop_recording()},
+            "analyze_source_pitch": lambda args: engine.analyze_source_pitch(
+                require(args, "paths", list)
+            ),
+            "reset_voice_pitch": lambda args: engine.reset_voice_pitch(),
         }
 
     LOG_COMMANDS = ("get_log", "clear_log", "save_log", "shutdown", "ping")
@@ -336,7 +348,18 @@ class EngineServer:
             ticker.cancel()
             server.close()
             if self.engine is not None:
-                await self.on_engine_thread(self.engine.shutdown)
+                try:
+                    await asyncio.wait_for(
+                        self.on_engine_thread(self.engine.shutdown), SHUTDOWN_TIMEOUT_SECONDS
+                    )
+                except asyncio.TimeoutError:
+                    print(
+                        "Engine shutdown did not finish within %.0f s "
+                        "(an audio device did not close); exiting anyway."
+                        % SHUTDOWN_TIMEOUT_SECONDS
+                    )
+                except Exception:
+                    print(traceback.format_exc())
             for writer in list(self.clients):
                 writer.close()
             try:
@@ -360,6 +383,12 @@ def main(argv=None):
     sys.stdout = LogWriter(server, sys.stdout)
     sys.stderr = LogWriter(server, sys.stderr)
     asyncio.run(server.serve())
+    print("Engine stopped.")
+    sys.stdout.flush()
+    sys.stderr.flush()
+    # Exit now: a worker thread stuck in an audio driver, or library threads
+    # (JACK, CUDA), would otherwise keep the process alive at interpreter exit.
+    os._exit(0)
 
 
 if __name__ == "__main__":

@@ -305,7 +305,7 @@ class SineGen(torch.nn.Module):
             uv = uv.float()
         return uv
 
-    def forward(self, f0, upp):
+    def forward(self, f0, upp, noise=None, phase0=None):
         """sine_tensor, uv = forward(f0)
         input F0: tensor(batchsize=1, length, dim=1)
                   f0 for unvoiced steps should be 0
@@ -348,16 +348,23 @@ class SineGen(torch.nn.Module):
             tmp_over_one_idx = (tmp_over_one[:, 1:, :] - tmp_over_one[:, :-1, :]) < 0
             cumsum_shift = torch.zeros_like(rad_values)
             cumsum_shift[:, 1:, :] = tmp_over_one_idx * -1.0
-            sine_waves = torch.sin(
-                torch.cumsum(rad_values + cumsum_shift, dim=1) * 2 * torch.pi
-            )
+            phase = torch.cumsum(rad_values + cumsum_shift, dim=1)
+            if phase0 is not None:
+                # Continue the previous chunk's phase (cycles) instead of 0.
+                phase = phase + phase0.to(phase.dtype).reshape(-1, 1, 1)
+            sine_waves = torch.sin(phase * 2 * torch.pi)
             sine_waves = sine_waves * self.sine_amp
             uv = self._f02uv(f0)
             uv = F.interpolate(
                 uv.transpose(2, 1), scale_factor=float(upp), mode="nearest"
             ).transpose(2, 1)
             noise_amp = uv * self.noise_std + (1 - uv) * self.sine_amp / 3
-            noise = noise_amp * torch.randn_like(sine_waves)
+            if noise is None:
+                noise = torch.randn_like(sine_waves)
+            else:
+                # Time-aligned noise from the caller (rtrvc chunk consistency).
+                noise = noise.to(sine_waves.dtype).reshape(sine_waves.shape)
+            noise = noise_amp * noise
             sine_waves = sine_waves * uv + noise
         return sine_waves, uv, noise
 
@@ -404,10 +411,10 @@ class SourceModuleHnNSF(torch.nn.Module):
         self.l_tanh = torch.nn.Tanh()
         # self.ddtype:int = -1
 
-    def forward(self, x, upp = 1):
+    def forward(self, x, upp = 1, noise=None, phase0=None):
         # if self.ddtype ==-1:
         #     self.ddtype = self.l_linear.weight.dtype
-        sine_wavs, uv, _ = self.l_sin_gen(x, upp)
+        sine_wavs, uv, _ = self.l_sin_gen(x, upp, noise, phase0)
         # print(x.dtype,sine_wavs.dtype,self.l_linear.weight.dtype)
         # if self.is_half:
         #     sine_wavs = sine_wavs.half()
@@ -499,8 +506,10 @@ class GeneratorNSF(torch.nn.Module):
         f0,
         g = None,
         n_res = None,
+        noise = None,
+        phase0 = None,
     ):
-        har_source, noi_source, uv = self.m_source(f0, self.upp)
+        har_source, noi_source, uv = self.m_source(f0, self.upp, noise, phase0)
         har_source = har_source.transpose(1, 2)
         if n_res is not None:
             n = int(n_res.item()) if isinstance(n_res, torch.Tensor) else int(n_res)
@@ -672,6 +681,9 @@ class SynthesizerTrnMs256NSFsid(nn.Module):
         skip_head = None,
         return_length = None,
         return_length2 = None,
+        noise = None,
+        source_noise = None,
+        phase0 = None,
     ):
         g = self.emb_g(sid).unsqueeze(-1)
         if skip_head is not None and return_length is not None:
@@ -684,16 +696,22 @@ class SynthesizerTrnMs256NSFsid(nn.Module):
             flow_head = max(head - 24, 0)
             dec_head = head - flow_head
             m_p, logs_p, x_mask = self.enc_p(phone, pitch, phone_lengths, flow_head)
-            z_p = (m_p + torch.exp(logs_p) * torch.randn_like(m_p) * 0.66666) * x_mask
+            if noise is None:
+                noise = torch.randn_like(m_p)
+            z_p = (m_p + torch.exp(logs_p) * noise.to(m_p.dtype) * 0.66666) * x_mask
             z = self.flow(z_p, x_mask, g=g, reverse=True)
             z = z[:, :, dec_head : dec_head + length]
             x_mask = x_mask[:, :, dec_head : dec_head + length]
             nsff0 = nsff0[:, head : head + length]
         else:
             m_p, logs_p, x_mask = self.enc_p(phone, pitch, phone_lengths)
-            z_p = (m_p + torch.exp(logs_p) * torch.randn_like(m_p) * 0.66666) * x_mask
+            if noise is None:
+                noise = torch.randn_like(m_p)
+            z_p = (m_p + torch.exp(logs_p) * noise.to(m_p.dtype) * 0.66666) * x_mask
             z = self.flow(z_p, x_mask, g=g, reverse=True)
-        o = self.dec(z * x_mask, nsff0, g=g, n_res=return_length2)
+        o = self.dec(
+            z * x_mask, nsff0, g=g, n_res=return_length2, noise=source_noise, phase0=phase0
+        )
         return o, x_mask, (z, z_p, m_p, logs_p)
 
 

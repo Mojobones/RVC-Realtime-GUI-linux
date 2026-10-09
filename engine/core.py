@@ -13,6 +13,7 @@ JACK worker, and the file decoder only touch the audio buffers and the
 import os
 import queue
 import shutil
+import subprocess
 import threading
 import time
 import traceback
@@ -32,6 +33,7 @@ from engine.settings import (
     MODEL_SETTING_KEYS,
     PERFORMANCE_DEFAULT_KEYS,
     PROJECT_ROOT,
+    RESETTABLE_MODEL_SETTING_KEYS,
     RESTART_SETTING_KEYS,
     EngineSettings,
     coerce_setting,
@@ -44,11 +46,20 @@ from engine.version import APP_TITLE, BUILD_LABEL
 from infer import rtrvc as rvc_for_realtime
 from tools.audio_fifo import AudioFrameFifo, enqueue_latest
 from tools.audio_routing import is_native_api, scatter_mono, select_channels
-from tools.cuda_graph import cuda_graph_enabled, run_cuda_graph
+from tools.cuda_graph import cuda_graph_enabled, run_cuda_graph, side_gpu_work
 from tools.file_audio_source import FileAudioSource
 from tools.model_import import ModelImportError, import_models
 from tools import rnnoise
-from tools.model_registry import discover_models
+from tools.limiter import soft_clip
+from tools.loudness import TARGETS_LUFS, LoudnessMeter
+from tools.model_registry import (
+    TrashError,
+    discover_models,
+    model_name_problem,
+    move_to_trash,
+    rename_model_folder,
+)
+from tools.pitch_match import PitchHistogram, measure_source_pitch, source_files
 from tools.splice import (
     CONFIDENCE_THRESHOLD,
     FADE_SECONDS,
@@ -59,6 +70,11 @@ from tools.torchgate import TorchGate
 from tools.wav_recorder import WavRecorder
 
 MODELS_ROOT = os.path.join(PROJECT_ROOT, "models")
+#: The user's measured voice pitch (tools/pitch_match.py), kept across runs.
+VOICE_PITCH_PATH = os.path.join(PROJECT_ROOT, "configs", "voice_pitch.json")
+VOICE_PITCH_SAVE_SECONDS = 30.0
+#: Pause between 10 s analysis pieces (~11 ms of GPU each) while converting.
+PITCH_ANALYSIS_PAUSE_SECONDS = 0.03
 MODEL_SETTINGS_SAVE_DELAY_SECONDS = 0.25
 METER_INTERVAL_SECONDS = 0.1
 #: How often running seam-confidence statistics are logged.
@@ -74,6 +90,15 @@ RNNOISE_DELAY_SECONDS = 0.020
 VOICE_THRESHOLD = 0.5
 #: Fade-in after the stale output that follows a held pause.
 RESUME_RAMP_SECONDS = 0.005
+#: Audio queued for an output beyond one chunk plus this margin is a standing
+#: backlog: a moment when inference fell behind leaves extra audio queued
+#: that, with input and output running at the same rate, never drains.  It
+#: is trimmed by dropping blocks of pure silence (see ``queue_output``).  The
+#: margin is at least twice the recent inference time, so trimming never
+#: leaves the output at risk of running dry.
+BACKLOG_MARGIN_SECONDS = 0.060
+#: How often a growing underrun count is logged.
+UNDERRUN_LOG_SECONDS = 5.0
 FUNCTIONS = {"vc": "vc", "passthrough": "im"}
 
 
@@ -138,6 +163,14 @@ class RealtimeEngine:
         self.latest_output_meter = 0.0
         self.latest_monitor_meter = 0.0
         self.latest_infer_time = 0
+        #: Silence dropped to drain a standing output backlog, in frames.
+        self.trimmed_frames = 0
+        #: Output callbacks that found less audio queued than they needed,
+        #: counted once audio has started flowing (reset per stream).
+        self.output_underruns = 0
+        self.logged_underruns = 0
+        self.underrun_logged_at = 0.0
+        self.output_flowing = False
         self.recorder = WavRecorder()
         #: Optional callable receiving each raw inference chunk (benchmarks).
         self.chunk_tap = None
@@ -156,6 +189,9 @@ class RealtimeEngine:
         self.refresh_models()
         self.devices.refresh()
         self.settings = load_settings()
+        self.voice_pitch = PitchHistogram.load(VOICE_PITCH_PATH)
+        self.voice_pitch_saved_at = time.monotonic()
+        self.pitch_analysis = None
         self.normalize_settings()
         self.settings.__dict__.update(self.model_settings_for(self.settings.model_name))
         self.log_startup_diagnostics()
@@ -174,6 +210,8 @@ class RealtimeEngine:
                     "name": model.name,
                     "model_file": model.model_path.name,
                     "index_file": model.index_path.name if model.index_path else None,
+                    "size_bytes": model.size_bytes,
+                    "modified": int(model.modified),
                 }
                 for model in self.models
             ],
@@ -190,6 +228,8 @@ class RealtimeEngine:
             "ffmpeg": os.path.isfile(self.ffmpeg_path),
             "rnnoise": rnnoise.available(),
             "missing_assets": missing_assets(),
+            "voice_pitch": self.voice_pitch.summary(),
+            "analyzing_pitch": self.pitch_analysis is not None,
         }
 
     def emit_state(self):
@@ -272,6 +312,58 @@ class RealtimeEngine:
         self.emit_state()
         return names
 
+    def delete_model(self, name):
+        """Move a model's folder to the Trash; another model is selected if needed."""
+        model = self.models_by_name.get(name)
+        if model is None:
+            raise EngineError("no_model", f"Unknown model: {name}")
+        if self.running and self.function == "vc" and name == self.settings.model_name:
+            raise EngineError("model_in_use", "Stop converting before deleting this model.")
+        # A pending settings save would recreate the folder after it is gone.
+        self.flush_model_settings_save(force=True)
+        try:
+            move_to_trash(model.directory)
+        except (OSError, subprocess.SubprocessError, TrashError) as error:
+            raise EngineError("delete_failed", str(error), model=name) from error
+        printt("Moved model to the Trash: %s", model.directory)
+        self.reload_models()
+        save_settings(self.settings)
+        self.status("model_deleted", name=name)
+
+    def rename_model(self, name, new_name):
+        """Rename a model's folder (its name everywhere); settings go with it."""
+        model = self.models_by_name.get(name)
+        if model is None:
+            raise EngineError("no_model", f"Unknown model: {name}")
+        if new_name == name:
+            return
+        problem = model_name_problem(new_name)
+        if problem is not None:
+            raise EngineError("bad_model_name", f"Invalid model name: {new_name!r}", reason=problem)
+        clash = next(
+            (other for other in self.models_by_name
+             if other != name and other.casefold() == new_name.casefold()),
+            None,
+        )
+        if clash is not None:
+            raise EngineError("model_name_taken", f"A model named {clash} already exists.")
+        if self.running and self.function == "vc" and name == self.settings.model_name:
+            raise EngineError("model_in_use", "Stop converting before renaming this model.")
+        # A pending settings save would recreate the old folder.
+        self.flush_model_settings_save(force=True)
+        try:
+            rename_model_folder(model.directory, new_name)
+        except FileExistsError as error:
+            raise EngineError("model_name_taken", f"{new_name} already exists.") from error
+        except OSError as error:
+            raise EngineError("rename_failed", str(error), model=name) from error
+        printt("Renamed model %s to %s", name, new_name)
+        if self.settings.model_name == name:
+            self.settings.model_name = new_name
+        self.reload_models()
+        save_settings(self.settings)
+        self.status("model_renamed", name=name, new_name=new_name)
+
     def reload_devices(self):
         if self.running:
             self.stop()
@@ -341,13 +433,20 @@ class RealtimeEngine:
             self.rvc.change_formant(self.settings.formant)
         if "index_rate" in changed:
             self.rvc.change_index_rate(self.settings.index_rate)
+        if "pitch_smoothing" in changed:
+            self.rvc.pitch_smoothing = self.settings.pitch_smoothing
+        if "protect" in changed and hasattr(self.rvc, "change_protect"):
+            self.rvc.change_protect(self.settings.protect)
+        if "input_gain_db" in changed and getattr(self, "loudness", None) is not None:
+            # The model follows the input level: earlier readings no longer apply.
+            self.loudness.reset()
         if "input_denoise" in changed and self.running:
             self.delay_time += (1 if self.settings.input_denoise else -1) * self.input_denoise_delay()
 
     def reset_settings(self, group):
         defaults = EngineSettings()
         if group == "general":
-            keys = MODEL_SETTING_KEYS
+            keys = RESETTABLE_MODEL_SETTING_KEYS
         elif group == "performance":
             keys = PERFORMANCE_DEFAULT_KEYS
         else:
@@ -376,6 +475,128 @@ class RealtimeEngine:
                 printt("Could not save model settings: %s", error)
         self.pending_model_settings_name = None
         self.model_settings_save_due = 0.0
+
+    # ------------------------------------------------------------------
+    # Pitch matching (tools/pitch_match.py)
+    # ------------------------------------------------------------------
+    def save_voice_pitch(self, force=False):
+        if not self.voice_pitch.changed:
+            return
+        now = time.monotonic()
+        if not force and now - self.voice_pitch_saved_at < VOICE_PITCH_SAVE_SECONDS:
+            return
+        self.voice_pitch_saved_at = now
+        try:
+            self.voice_pitch.save(VOICE_PITCH_PATH)
+        except OSError as error:
+            printt("Could not save the voice pitch: %s", error)
+
+    def reset_voice_pitch(self):
+        self.voice_pitch.reset()
+        self.save_voice_pitch(force=True)
+        self.emit_state()
+
+    def analyze_source_pitch(self, paths):
+        """Start measuring the median pitch of the selected model's speaker.
+
+        ``paths`` are audio files or folders (ideally the model's training
+        data).  Runs in the background; ``finish_pitch_analysis`` stores the
+        result with that model's settings (``source_pitch_hz``) and the front
+        end recommends the pitch that moves the user's median onto it.
+        """
+        if not isinstance(paths, list) or not paths or not all(isinstance(p, str) for p in paths):
+            raise EngineError("bad_request", "paths must be a non-empty list of strings")
+        model_name = self.settings.model_name
+        if model_name not in self.models_by_name:
+            raise EngineError("no_model", "Select a model first.")
+        if self.pitch_analysis is not None:
+            raise EngineError("pitch_analysis_busy", "A clip is already being analysed.")
+        if not os.path.isfile(self.ffmpeg_path):
+            raise EngineError("ffmpeg_missing", "FFmpeg was not found.")
+        try:
+            files = source_files(paths)
+        except FileNotFoundError as error:
+            raise EngineError("no_audio_file", f"Audio file not found: {error}") from error
+        if not files:
+            raise EngineError("no_audio_file", "No audio files were found.")
+        self.require_assets("rmvpe")
+        job = {"model": model_name, "files": files, "result": None, "error": None}
+        job["thread"] = threading.Thread(
+            target=self.run_pitch_analysis, args=(job,), name="rvc-pitch-analysis", daemon=True
+        )
+        self.pitch_analysis = job
+        self.status("analyzing_pitch", name=model_name, files=len(files))
+        job["thread"].start()
+        self.emit_state()
+
+    def run_pitch_analysis(self, job):
+        """Worker thread: only touches ``job`` and its own pitch detector.
+
+        All of its GPU work goes through ``side_gpu_work``: no CUDA Graph
+        captures of its own, and never during a capture by the audio path,
+        which would break that capture and the allocator with it.
+        """
+        from engine.assets import RMVPE_PATH
+        from infer.rmvpe import RMVPE
+
+        def pause():
+            # Share the GPU with live conversion: about a quarter of its time.
+            if self.running:
+                time.sleep(PITCH_ANALYSIS_PAUSE_SECONDS)
+
+        def detect(audio):
+            with side_gpu_work():
+                return detector.infer_from_audio(audio, thred=0.03)
+
+        detector = None
+        try:
+            with side_gpu_work():
+                # A separate detector: the audio thread may be using the stream's.
+                detector = RMVPE(RMVPE_PATH, is_half=self.config.is_half, device=self.config.device)
+            job["result"] = measure_source_pitch(self.ffmpeg_path, job["files"], detect, pause)
+        except Exception as error:  # reported to the front end by tick()
+            traceback.print_exc()
+            job["error"] = error
+        finally:
+            with side_gpu_work():
+                del detector
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+    def finish_pitch_analysis(self):
+        """Command thread: apply a finished analysis (called from ``tick``)."""
+        job = self.pitch_analysis
+        if job is None or job["thread"].is_alive():
+            return
+        self.pitch_analysis = None
+        model_name = job["model"]
+        if job["error"] is not None:
+            self.emit("error", {"code": "pitch_analysis_failed", "message": str(job["error"])})
+            return
+        median_hz, seconds = job["result"]
+        if median_hz is None:
+            self.emit("error", {"code": "no_voice_found", "message": "No voiced speech was found."})
+            return
+        printt(
+            "Source pitch for %s: median %.1f Hz over %.0f s of voiced speech",
+            model_name, median_hz, seconds,
+        )
+        median_hz = round(median_hz, 2)
+        if model_name == self.settings.model_name:
+            self.update_settings({"source_pitch_hz": median_hz})
+            self.flush_model_settings_save(force=True)
+        elif model_name in self.models_by_name:
+            # The user switched models meanwhile; store it with the analysed one.
+            self.flush_model_settings_save(force=True)
+            directory = str(self.models_by_name[model_name].directory)
+            values = load_model_settings(directory)
+            values["source_pitch_hz"] = median_hz
+            try:
+                save_model_settings(directory, EngineSettings(**values))
+            except OSError as error:
+                printt("Could not save model settings: %s", error)
+        self.status("pitch_analyzed", name=model_name, median_hz=median_hz, seconds=round(seconds, 1))
+        self.emit_state()
 
     # ------------------------------------------------------------------
     # Diagnostics
@@ -436,6 +657,9 @@ class RealtimeEngine:
     def tick(self):
         """Called about 20 times per second from the command thread."""
         self.flush_model_settings_save()
+        self.save_voice_pitch()
+        self.finish_pitch_analysis()
+        self.log_underruns()
         if self.running and not self.streams_active():
             printt("Audio stream stopped unexpectedly; returning to the idle state.")
             self.stop()
@@ -474,12 +698,28 @@ class RealtimeEngine:
             "output": self.latest_output_meter if self.running else 0.0,
             "monitor": self.latest_monitor_meter if self.running else 0.0,
             "infer_ms": self.latest_infer_time if self.running else None,
+            "queued_ms": self.queued_ms(),
+            "underruns": self.output_underruns if self.running else None,
             "recording_seconds": recording_seconds,
             "file_position": source.position if source else None,
+            "voice_pitch": self.voice_pitch.summary() if self.running else None,
+            "loudness": self.output_loudness() if self.running else None,
         }
+
+    def output_loudness(self):
+        """The output-level reading at the current gain (tools/loudness.py)."""
+        meter = getattr(self, "loudness", None)
+        if meter is None:
+            return None
+        gain_db = self.settings.output_gain_db
+        if self.file_source_active:
+            volume = float(np.clip(self.settings.file_input_volume, 0.0, 1.0))
+            gain_db += 20 * np.log10(max(volume, 1e-6))
+        return meter.summary(gain_db, TARGETS_LUFS[self.settings.loudness_target])
 
     def shutdown(self):
         self.flush_model_settings_save(force=True)
+        self.save_voice_pitch(force=True)
         self.stop()
 
     # ------------------------------------------------------------------
@@ -631,6 +871,8 @@ class RealtimeEngine:
                 self.config,
                 self.rvc if hasattr(self, "rvc") else None,
             )
+            self.rvc.change_protect(self.settings.protect)
+            self.rvc.pitch_smoothing = self.settings.pitch_smoothing
         except Exception as error:
             raise EngineError(
                 "model_load_failed",
@@ -700,6 +942,16 @@ class RealtimeEngine:
         if self.settings.hold_detector == "voice" and self.vad is None:
             printt("Silence detection: voice detection needs RNNoise at 48 kHz; using loudness")
         self.seam_confidences = []
+        # Per-stream counters (see __init__).
+        self.trimmed_frames = 0
+        self.output_underruns = 0
+        self.logged_underruns = 0
+        self.output_flowing = False
+        #: Speech loudness of the output before the gain (output-level indicator).
+        self.loudness = LoudnessMeter(self.samplerate)
+        reset_stream = getattr(self.rvc, "reset_stream_state", None)
+        if reset_stream is not None:
+            reset_stream()
         self.context_held = False
         self.previous_block_silent = False
         self.held_block = None
@@ -868,6 +1120,10 @@ class RealtimeEngine:
 
     def output_audio_callback(self, outdata, frames, times, status):
         block = self.read_audio_target(self.output_queue, frames)
+        if block is not None:
+            self.output_flowing = True
+        if self.output_flowing and self.running and (block is None or block.shape[0] < frames):
+            self.output_underruns += 1
         self.write_output_block(outdata, block)
         # Use the real device callback timeline for recording.  The output
         # can be delayed by RVC's buffers, which is intentionally preserved.
@@ -968,6 +1224,7 @@ class RealtimeEngine:
         self.latest_input_meter = 0.0
         self.latest_output_meter = 0.0
         self.latest_monitor_meter = 0.0
+        self.save_voice_pitch(force=True)
         if was_running:
             self.status(
                 "passthrough_stopped" if self.function == "im" else "conversion_stopped"
@@ -1015,6 +1272,10 @@ class RealtimeEngine:
                 self.return_length,
                 settings.f0method,
             )
+            input_f0 = getattr(self.rvc, "input_f0", None)
+            if input_f0 is not None and not self.file_source_active:
+                # Only the microphone is the user's own voice.
+                self.voice_pitch.add(input_f0)
             if self.resampler2 is not None:
                 infer_wav = run_cuda_graph(
                     self.resampler2,
@@ -1170,8 +1431,13 @@ class RealtimeEngine:
         self.stale_samples = max(0, self.splicer.input_length - fresh)
 
     def shift_pitch_cache(self):
-        """Advance the RVC pitch cache by one block, as an inference would."""
+        """Advance the RVC stream state by one block, as an inference would."""
         shift = self.block_frame_16k // 160
+        advance = getattr(self.rvc, "advance", None)
+        if advance is not None:
+            # Pitch cache plus the time-aligned noise (infer/rtrvc.py).
+            advance(shift)
+            return
         for name in ("cache_pitch", "cache_pitchf"):
             cache = getattr(self.rvc, name, None)
             if cache is not None:
@@ -1231,16 +1497,16 @@ class RealtimeEngine:
     def finish_block(self, output, start_time):
         """Apply output gain and file volume, update meters, queue the block."""
         settings = self.settings
-        output_block = torch.clamp(output[: self.block_frame] * settings.output_gain, -1.0, 1.0)
-        output_mono = output_block.cpu().numpy()
+        before_gain = output[: self.block_frame].cpu().numpy()
+        self.loudness.process(before_gain)
+        # Soft clip rather than a hard clamp: loud peaks are rounded, not chopped.
+        output_mono = soft_clip(before_gain * np.float32(settings.output_gain))
         # RVC can restore the source loudness internally (for example through
         # volume-envelope mixing).  Apply the file-player volume after
         # inference so each 1% step controls the audible result.
         if self.file_source_active:
             output_mono *= np.float32(np.clip(settings.file_input_volume, 0.0, 1.0))
-        monitor_mono = np.clip(
-            output_mono * np.float32(settings.monitor_gain), -1.0, 1.0
-        )
+        monitor_mono = soft_clip(output_mono * np.float32(settings.monitor_gain))
         meter_now = time.perf_counter()
         if meter_now - self.last_output_meter_update >= METER_INTERVAL_SECONDS:
             self.latest_output_meter = peak_meter(output_mono)
@@ -1248,8 +1514,8 @@ class RealtimeEngine:
                 0.0 if self.monitor_device_index is None else peak_meter(monitor_mono)
             )
             self.last_output_meter_update = meter_now
-        self.enqueue_audio_target(self.output_queue, output_mono)
-        self.enqueue_audio_target(self.monitor_queue, monitor_mono)
+        self.queue_output(self.output_queue, output_mono)
+        self.queue_output(self.monitor_queue, monitor_mono)
         if self.running:
             self.latest_infer_time = int((time.perf_counter() - start_time) * 1000)
         return output_mono
@@ -1269,6 +1535,50 @@ class RealtimeEngine:
             len(values),
             CONFIDENCE_THRESHOLD,
         )
+
+    def queued_frames(self, target):
+        """Frames waiting in an output queue or FIFO."""
+        if target is None:
+            return 0
+        if isinstance(target, AudioFrameFifo):
+            return target.available_frames
+        return target.qsize() * self.block_frame
+
+    def queue_output(self, target, block):
+        """Queue a finished block, or drop it if it is silence over a backlog."""
+        if target is None:
+            return
+        if not self.file_source_active and not np.any(block):
+            margin = max(BACKLOG_MARGIN_SECONDS, 2 * self.latest_infer_time / 1000)
+            queued = self.queued_frames(target)
+            if queued >= self.block_frame + int(margin * self.samplerate):
+                self.trimmed_frames += block.shape[0]
+                printt(
+                    "Output backlog %.0f ms: dropped %.0f ms of silence to catch up",
+                    1000 * queued / self.samplerate,
+                    1000 * block.shape[0] / self.samplerate,
+                )
+                return
+        self.enqueue_audio_target(target, block)
+
+    def log_underruns(self):
+        """Command thread: report new output underruns every few seconds."""
+        new = self.output_underruns - self.logged_underruns
+        now = time.monotonic()
+        if new <= 0 or now - self.underrun_logged_at < UNDERRUN_LOG_SECONDS:
+            return
+        self.logged_underruns = self.output_underruns
+        self.underrun_logged_at = now
+        printt("Output underruns: %d (+%d): the output ran dry, an audible gap", self.output_underruns, new)
+
+    def queued_ms(self):
+        """Audio waiting between the mic and the output right now, in ms."""
+        if not self.running or not self.samplerate:
+            return None
+        frames = self.queued_frames(self.output_queue)
+        if self.native_input_fifo is not None:
+            frames += self.native_input_fifo.available_frames
+        return round(1000 * frames / self.samplerate)
 
     @staticmethod
     def enqueue_audio_target(target, block):
@@ -1439,10 +1749,10 @@ class RealtimeEngine:
             self.audio_callback(block[:, None], self.block_frame, None, None)
             return
         volume = float(np.clip(self.settings.file_input_volume, 0.0, 1.0))
-        block = np.clip(block * np.float32(volume), -1.0, 1.0)
+        block = soft_clip(block * np.float32(volume))
         self.enqueue_audio_target(self.output_queue, block)
         self.enqueue_audio_target(
-            self.monitor_queue, block * np.float32(self.settings.monitor_gain)
+            self.monitor_queue, soft_clip(block * np.float32(self.settings.monitor_gain))
         )
 
     def stop_file_playback(self):

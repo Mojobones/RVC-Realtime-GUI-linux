@@ -5,7 +5,7 @@ use cosmic::prelude::*;
 use cosmic::widget::{self, settings};
 
 use crate::app::{
-    App, Connection, F0_METHODS, Function, HOLD_DETECTORS, INPUT_SOURCES, Message, Num, Page,
+    App, Connection, LOUDNESS_TARGETS, recommended_pitch, F0_METHODS, Function, HOLD_DETECTORS, INPUT_SOURCES, Message, Num, Page,
     RECORDING_MODES, Toggle, VALUE_INPUT_ID,
 };
 use crate::engine::State;
@@ -25,6 +25,7 @@ pub fn view(app: &App, page: Page) -> Element<'_, Message> {
     };
     let content = match page {
         Page::Model => model_page(app, state),
+        Page::Library => crate::library::page(app, state),
         Page::Audio => audio_page(app, state),
         Page::Performance => performance_page(app, state),
         Page::Recording => recording_page(app, state),
@@ -67,7 +68,7 @@ fn page_column<'a>(sections: Vec<Element<'a, Message>>) -> Element<'a, Message> 
 }
 
 /// A labelled slider with its formatted value.  Clicking the value opens a
-/// field to type an exact one (Enter applies, Escape or clicking away cancels).
+/// field to type an exact one (Enter or clicking away applies, Escape cancels).
 fn slider_item<'a>(
     app: &'a App,
     title: String,
@@ -84,7 +85,7 @@ fn slider_item<'a>(
                 .id(VALUE_INPUT_ID.clone())
                 .on_input(Message::EditInput)
                 .on_submit(|_| Message::EditSubmit)
-                .on_unfocus(Message::EditCancel)
+                .on_unfocus(Message::EditBlur)
                 .width(Length::Fixed(VALUE_WIDTH));
             if invalid {
                 input = input.error(fl!("value-invalid"));
@@ -106,8 +107,11 @@ fn slider_item<'a>(
         )
         .into(),
     };
-    settings::item(
-        title,
+    let mut item = settings::item::builder(title);
+    if let Some(description) = num_description(num) {
+        item = item.description(description);
+    }
+    item.control(
         widget::row::with_capacity(2)
             .push(
                 widget::slider(min..=max, value.clamp(min, max), move |v| {
@@ -124,13 +128,36 @@ fn slider_item<'a>(
     .into()
 }
 
+/// What each slider does, shown under its title.
+fn num_description(num: Num) -> Option<String> {
+    Some(match num {
+        Num::Pitch => fl!("pitch-detail"),
+        Num::Formant => fl!("formant-detail"),
+        Num::IndexRate => fl!("index-rate-detail"),
+        Num::Protect => fl!("protect-detail"),
+        Num::InputGain => fl!("input-gain-detail"),
+        Num::OutputGain => fl!("output-gain-detail"),
+        Num::MonitorGain => fl!("monitor-gain-detail"),
+        Num::NoiseGate => fl!("noise-gate-detail"),
+        Num::RmsMix => fl!("volume-envelope-detail"),
+        Num::BlockTime => fl!("chunk-detail"),
+        Num::Extra => fl!("extra-detail"),
+        Num::FileVolume => fl!("file-volume-detail"),
+    })
+}
+
 fn dropdown_item<'a>(
     title: String,
+    description: Option<String>,
     labels: &'a [String],
     selected: Option<usize>,
     on_select: fn(usize) -> Message,
 ) -> Element<'a, Message> {
-    settings::item(title, widget::dropdown(labels, selected, on_select)).into()
+    let mut item = settings::item::builder(title);
+    if let Some(description) = description {
+        item = item.description(description);
+    }
+    item.control(widget::dropdown(labels, selected, on_select)).into()
 }
 
 fn position_of(labels: &[String], value: &str) -> Option<usize> {
@@ -196,6 +223,7 @@ fn model_page<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
             } else {
                 dropdown_item(
                     fl!("model"),
+                    None,
                     &app.model_names,
                     position_of(&app.model_names, selected),
                     Message::SelectModel,
@@ -205,16 +233,23 @@ fn model_page<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
                 widget::row::with_capacity(4)
                     .push(widget::text::caption(files).width(Length::Fill))
                     .push(
+                        widget::button::standard(fl!("page-library"))
+                            .leading_icon(widget::icon::from_name("view-list-symbolic"))
+                            .on_press(Message::OpenLibrary),
+                    )
+                    .push(
                         widget::button::standard(fl!("reload"))
                             .leading_icon(widget::icon::from_name("view-refresh-symbolic"))
                             .on_press(Message::ReloadModels),
                     )
+                    .spacing(cosmic::theme::spacing().space_xs)
                     .align_y(Alignment::Center),
             )
             .into(),
         settings::section()
             .title(fl!("section-voice"))
             .add(slider_item(app, fl!("pitch"), Num::Pitch, state, signed(1)))
+            .add(pitch_match_item(state))
             .add(slider_item(
                 app,
                 fl!("formant"),
@@ -228,6 +263,20 @@ fn model_page<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
                 Num::IndexRate,
                 state,
                 ratio,
+            ))
+            .add(slider_item(
+                app,
+                fl!("protect"),
+                Num::Protect,
+                state,
+                |value| {
+                    // 0.5 is RVC's "off"; lower values protect consonants more.
+                    if value >= 0.5 {
+                        fl!("off")
+                    } else {
+                        format!("{value:.2}")
+                    }
+                },
             ))
             .into(),
         settings::section()
@@ -246,6 +295,7 @@ fn model_page<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
                 state,
                 decibels,
             ))
+            .add(output_level_item(app, state))
             .add(slider_item(
                 app,
                 fl!("monitor-gain"),
@@ -272,6 +322,131 @@ fn model_page<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
     page_column(sections)
 }
 
+/// The pitch that lines the user's voice up with the model's speaker: their
+/// median from a measured clip, the user's measured live from the microphone.
+fn pitch_match_item(state: &State) -> Element<'_, Message> {
+    let space = cosmic::theme::spacing();
+    let source_hz = state.settings.source_pitch_hz;
+    let voice = state.voice_pitch;
+    let theirs = if state.analyzing_pitch {
+        fl!("pitch-match-analyzing")
+    } else if source_hz > 0.0 {
+        fl!("pitch-match-source", hz = format!("{source_hz:.1}"))
+    } else {
+        fl!("pitch-match-no-source")
+    };
+    let yours = match voice.median_hz {
+        Some(hz) => fl!(
+            "pitch-match-voice",
+            hz = format!("{hz:.1}"),
+            minutes = format!("{:.1}", voice.seconds / 60.0)
+        ),
+        None => fl!(
+            "pitch-match-listening",
+            seconds = format!("{:.0}", voice.seconds),
+            needed = format!("{:.0}", voice.needed_seconds)
+        ),
+    };
+
+    let mut control = widget::row::with_capacity(4)
+        .spacing(space.space_xs)
+        .align_y(Alignment::Center);
+    if let Some(recommended) = recommended_pitch(state) {
+        let applied = (recommended - state.settings.pitch).abs() < 0.05;
+        control = control
+            .push(widget::text::body(format!("{recommended:+.1}")))
+            .push(
+                widget::button::suggested(fl!("pitch-match-apply"))
+                    .on_press_maybe((!applied).then_some(Message::ApplyRecommendedPitch)),
+            );
+    }
+    control = control
+        .push(
+            widget::button::standard(fl!("pitch-match-measure"))
+                .leading_icon(widget::icon::from_name("document-open-symbolic"))
+                .on_press_maybe((!state.analyzing_pitch).then_some(Message::PickPitchClips)),
+        )
+        .push(widget::tooltip(
+            widget::button::icon(widget::icon::from_name("edit-clear-symbolic"))
+                .on_press_maybe((voice.seconds > 0.0).then_some(Message::ResetVoicePitch)),
+            widget::text::caption(fl!("pitch-match-reset-voice")),
+            widget::tooltip::Position::Top,
+        ));
+
+    settings::item::builder(fl!("pitch-match"))
+        .description(format!("{theirs}\n{yours}"))
+        .control(control)
+        .into()
+}
+
+/// How loud the output sounds to others, with a one-click gain fix.
+fn output_level_item<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
+    let space = cosmic::theme::spacing();
+    let reading = app.meters.loudness.as_ref().filter(|_| state.running);
+    let target_index = LOUDNESS_TARGETS
+        .iter()
+        .position(|target| *target == state.settings.loudness_target);
+    let description = match reading {
+        None => fl!("output-level-idle"),
+        Some(reading) => match (reading.lufs, reading.verdict.as_deref()) {
+            (None, _) => fl!("output-level-listening"),
+            (Some(lufs), None) => fl!(
+                "output-level-measuring",
+                lufs = format!("{lufs:.1}"),
+                seconds = format!("{:.0}", reading.speech_seconds)
+            ),
+            (Some(lufs), Some(verdict)) => {
+                let text = match verdict {
+                    "quiet" if reading.adjust_db > 0.0 => fl!("output-level-quiet"),
+                    // Peaks already reach full scale: raising would squash them.
+                    "quiet" => fl!("output-level-quiet-peaky"),
+                    "loud" if reading.over_percent > 1.0 => fl!("output-level-squashed"),
+                    "loud" => fl!("output-level-loud"),
+                    _ => fl!("output-level-good"),
+                };
+                fl!(
+                    "output-level-reading",
+                    lufs = format!("{lufs:.1}"),
+                    target = format!("{:.0}", reading.target_lufs),
+                    verdict = text
+                )
+            }
+        },
+    };
+    let mut control = widget::row::with_capacity(3)
+        .spacing(space.space_xs)
+        .align_y(Alignment::Center);
+    if let Some(reading) = reading.filter(|r| r.verdict.is_some() && r.adjust_db != 0.0) {
+        control = control
+            .push(widget::text::body(format!("{:+.1} dB", reading.adjust_db)))
+            .push(
+                widget::button::suggested(fl!("output-level-apply"))
+                    .on_press(Message::ApplyLoudness),
+            );
+    }
+    control = control.push(widget::dropdown(
+        &app.loudness_target_labels,
+        target_index,
+        Message::SelectLoudnessTarget,
+    ));
+    settings::item::builder(fl!("output-level"))
+        .description(description)
+        .control(control)
+        .into()
+}
+
+/// One-line output-level verdict for the control bar.
+fn level_summary(app: &App) -> Option<(String, &'static str)> {
+    let reading = app.meters.loudness.as_ref()?;
+    let (text, icon) = match reading.verdict.as_deref() {
+        Some("good") => (fl!("level-good"), "emblem-ok-symbolic"),
+        Some("quiet") => (fl!("level-quiet"), "audio-volume-low-symbolic"),
+        Some("loud") => (fl!("level-loud"), "dialog-warning-symbolic"),
+        _ => (fl!("level-measuring"), "audio-volume-medium-symbolic"),
+    };
+    Some((text, icon))
+}
+
 fn reset_row<'a>(label: String, group: &'static str) -> Element<'a, Message> {
     widget::row::with_capacity(4)
         .push(widget::space::horizontal())
@@ -295,6 +470,7 @@ fn audio_page<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
         .title(fl!("section-input"))
         .add(dropdown_item(
             fl!("input-source"),
+            Some(fl!("input-source-detail")),
             &app.source_labels,
             source_index,
             Message::SelectInputSource,
@@ -329,6 +505,7 @@ fn audio_page<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
     } else {
         input = input.add(dropdown_item(
             fl!("input-device"),
+            Some(fl!("input-device-detail")),
             &app.input_labels,
             position_of(&app.input_labels, &settings_.input_device),
             Message::SelectInput,
@@ -343,12 +520,14 @@ fn audio_page<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
         .title(fl!("section-output"))
         .add(dropdown_item(
             fl!("output-device"),
+            Some(fl!("output-device-detail")),
             &app.output_labels,
             position_of(&app.output_labels, &settings_.output_device),
             Message::SelectOutput,
         ))
         .add(dropdown_item(
             fl!("monitor-device"),
+            Some(fl!("monitor-device-detail")),
             &app.monitor_labels,
             monitor_index,
             Message::SelectMonitor,
@@ -438,10 +617,22 @@ fn performance_page<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> 
             .title(fl!("section-inference"))
             .add(dropdown_item(
                 fl!("pitch-detector"),
+                Some(fl!("pitch-detector-detail")),
                 &app.f0_labels,
                 f0_index,
                 Message::SelectF0,
             ))
+            .add(
+                settings::item::builder(fl!("pitch-smoothing"))
+                    .description(if settings_.f0method == "rmvpe" {
+                        fl!("pitch-smoothing-detail")
+                    } else {
+                        fl!("pitch-smoothing-rmvpe-only")
+                    })
+                    .toggler(settings_.pitch_smoothing, |value| {
+                        Message::Toggle(Toggle::PitchSmoothing, value)
+                    }),
+            )
             .add(slider_item(
                 app,
                 fl!("volume-envelope"),
@@ -451,6 +642,7 @@ fn performance_page<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> 
             ))
             .add(dropdown_item(
                 fl!("gpu"),
+                Some(fl!("gpu-detail")),
                 &app.gpu_labels,
                 gpu_index,
                 Message::SelectGpu,
@@ -491,11 +683,13 @@ fn performance_page<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> 
                         Message::Toggle(Toggle::InputDenoise, value)
                     }),
             )
-            .add(settings::item(
-                fl!("output-denoise"),
-                widget::toggler(settings_.output_denoise)
-                    .on_toggle(|value| Message::Toggle(Toggle::OutputDenoise, value)),
-            ))
+            .add(
+                settings::item::builder(fl!("output-denoise"))
+                    .description(fl!("output-denoise-detail"))
+                    .toggler(settings_.output_denoise, |value| {
+                        Message::Toggle(Toggle::OutputDenoise, value)
+                    }),
+            )
             .into(),
         reset_row(fl!("reset-performance"), "performance"),
     ])
@@ -538,6 +732,7 @@ fn recording_page<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
             .title(fl!("section-recording"))
             .add(dropdown_item(
                 fl!("recording-mode"),
+                Some(fl!("recording-mode-detail")),
                 &app.recording_mode_labels,
                 mode_index,
                 Message::SelectRecordingMode,
@@ -644,20 +839,46 @@ pub fn control_bar<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
         .spacing(2);
 
     let dash = || "—".to_string();
+    let with_tip = |text: String, tip: String| {
+        widget::tooltip(
+            widget::text::caption(text),
+            widget::text::caption(tip),
+            widget::tooltip::Position::Top,
+        )
+    };
     let stats = widget::column::with_capacity(4)
-        .push(widget::text::caption(fl!(
-            "latency",
-            value = state.delay_ms.map(|ms| ms.to_string()).unwrap_or_else(dash)
-        )))
-        .push(widget::text::caption(fl!(
-            "inference",
-            value = app
-                .meters
-                .infer_ms
-                .map(|ms| ms.to_string())
-                .unwrap_or_else(dash)
-        )))
-        .width(Length::Fixed(120.0));
+        .push(with_tip(
+            fl!(
+                "latency",
+                value = state
+                    .delay_ms
+                    .map(|ms| (ms + i64::from(app.meters.queued_ms.unwrap_or(0))).to_string())
+                    .unwrap_or_else(dash)
+            ),
+            fl!("latency-detail"),
+        ))
+        .push(with_tip(
+            fl!(
+                "inference",
+                value = app
+                    .meters
+                    .infer_ms
+                    .map(|ms| ms.to_string())
+                    .unwrap_or_else(dash)
+            ),
+            fl!("inference-detail"),
+        ));
+    let stats = match level_summary(app).filter(|_| state.running) {
+        Some((text, icon)) => stats.push(
+            widget::row::with_capacity(2)
+                .push(widget::icon::from_name(icon).size(14))
+                .push(widget::text::caption(text))
+                .spacing(space.space_xxs)
+                .align_y(Alignment::Center),
+        ),
+        None => stats,
+    }
+    .width(Length::Fixed(140.0));
 
     widget::container(
         widget::row::with_capacity(4)

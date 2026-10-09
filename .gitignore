@@ -5,6 +5,7 @@ logs/
 recordings/
 configs/config.json
 configs/engine.json
+configs/voice_pitch.json
 models/*/
 !models/README.md
 

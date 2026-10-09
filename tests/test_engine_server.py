@@ -42,6 +42,14 @@ class FakeEngine:
         self.shut_down = True
 
 
+class HangingShutdownEngine(FakeEngine):
+    """Shutdown never returns, like an audio device that will not close."""
+
+    def shutdown(self):
+        self.shut_down = True
+        threading.Event().wait(2)
+
+
 class EngineServerTest(unittest.TestCase):
     def start_server(self, engine_factory, exit_when_idle=None):
         self.directory = tempfile.mkdtemp(prefix="rvc-")
@@ -150,6 +158,23 @@ class EngineServerTest(unittest.TestCase):
 
         self.thread.join(5)
         self.assertFalse(self.thread.is_alive())
+        self.assertFalse(os.path.exists(self.socket_path))
+        os.rmdir(self.directory)
+
+    def test_exits_even_if_the_engine_shutdown_hangs(self):
+        from unittest import mock
+
+        from engine import server as server_module
+
+        with mock.patch.object(server_module, "SHUTDOWN_TIMEOUT_SECONDS", 0.3):
+            self.start_server(HangingShutdownEngine, exit_when_idle=0.2)
+            client = self.connect_ready()
+            client.close()
+            started = time.monotonic()
+            self.thread.join(5)
+        self.assertFalse(self.thread.is_alive())
+        self.assertLess(time.monotonic() - started, 3)
+        self.assertTrue(self.server.engine.shut_down)
         self.assertFalse(os.path.exists(self.socket_path))
         os.rmdir(self.directory)
 

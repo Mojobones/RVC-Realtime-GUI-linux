@@ -92,6 +92,25 @@ def seam_flux_ratio(audio, block, fade, n_fft=1024, hop=256):
     return float(flux[in_seam].mean() / (np.median(flux[~in_seam]) + 1e-12))
 
 
+def overlap_agreement(chunks, samplerate, block):
+    """Correlation of each chunk's head with the previous chunk's continuation.
+
+    Measured where the two render the same moment (``block`` samples apart),
+    before any splicing: 1.0 means consecutive chunks agree exactly.
+    """
+    reference = WsolaSplicer(samplerate, block, torch.device("cpu"))
+    span = reference.fade + reference.search
+    values = []
+    for previous, current in zip(chunks, chunks[1:]):
+        earlier = np.asarray(previous[block : block + span], dtype=np.float64)
+        later = np.asarray(current[:span], dtype=np.float64)
+        if np.mean(earlier**2) <= AUDIBLE_POWER or earlier.shape != later.shape:
+            continue
+        denominator = np.sqrt(np.sum(earlier**2) * np.sum(later**2)) + 1e-12
+        values.append(float(np.sum(earlier * later) / denominator))
+    return np.array(values)
+
+
 def compare(directory):
     import soundfile as sf
 
@@ -118,21 +137,37 @@ def compare(directory):
     print(f"{'metric':<24}{'sola':>12}{'wsola':>12}")
     for key in results["sola"]:
         print(f"{key:<24}{results['sola'][key]:>12.3f}{results['wsola'][key]:>12.3f}")
+    agreement = overlap_agreement(chunks, rate, block)
+    if agreement.size:
+        print(
+            f"\noverlap agreement before splicing: mean {agreement.mean():.3f}, "
+            f"p5 {np.percentile(agreement, 5):.3f} over {agreement.size} chunk pairs"
+        )
     print(f"\nListen: {directory}/sola.wav and {directory}/wsola.wav")
     return results
 
 
-def record(model_name, input_path, directory, block_time, f0method):
+def record(model_name, input_path, directory, block_time, f0method, consistency=True):
     import librosa
     import soundfile as sf
+    from unittest import mock
 
     from engine.core import RealtimeEngine
+    from infer import rtrvc
+
+    with mock.patch.object(rtrvc, "CHUNK_CONSISTENCY", consistency):
+        _record(RealtimeEngine, model_name, input_path, directory, block_time, f0method, librosa, sf)
+
+
+def _record(RealtimeEngine, model_name, input_path, directory, block_time, f0method, librosa, sf):
 
     engine = RealtimeEngine(lambda event, data: None)
     model = engine.models_by_name.get(model_name)
     if model is None:
         raise SystemExit(f"Unknown model {model_name!r}; have: {sorted(engine.models_by_name)}")
     engine.settings.block_time = block_time
+    # Held blocks skip inference and would leave gaps between recorded chunks.
+    engine.settings.hold_context = False
     engine.settings.f0method = f0method
     engine.settings.model_name = model_name
     engine.settings.__dict__.update(engine.model_settings_for(model_name))
@@ -171,12 +206,21 @@ def main(argv=None):
     record_parser.add_argument("--input", required=True, help="speech or singing WAV")
     record_parser.add_argument("--block", type=float, default=0.25, help="chunk seconds")
     record_parser.add_argument("--f0", default="rmvpe", choices=("rmvpe", "fcpe", "pm"))
+    record_parser.add_argument(
+        "--consistency",
+        default="on",
+        choices=("on", "off"),
+        help="time-aligned noise and phase across chunks (infer/rtrvc.py CHUNK_CONSISTENCY)",
+    )
     record_parser.add_argument("--dir", default=DEFAULT_DIR)
     compare_parser = sub.add_parser("compare", help="replay chunks through SOLA and WSOLA")
     compare_parser.add_argument("--dir", default=DEFAULT_DIR)
     options = parser.parse_args(argv)
     if options.command == "record":
-        record(options.model, options.input, options.dir, options.block, options.f0)
+        record(
+            options.model, options.input, options.dir, options.block, options.f0,
+            consistency=options.consistency == "on",
+        )
     else:
         compare(options.dir)
     return 0

@@ -40,7 +40,8 @@ SILENCE_POWER = 1e-8
 class WsolaSplicer:
     def __init__(self, samplerate, block, device, dtype=torch.float32):
         zc = samplerate // 100
-        self.fade = 4 * zc
+        # Read at construction so benchmarks can try other lengths.
+        self.fade = int(round(FADE_SECONDS * 100)) * zc
         # One 10 ms frame, so the inference length stays a whole number of
         # frames at any rate (zc is odd at 44.1 kHz).
         self.search = zc
